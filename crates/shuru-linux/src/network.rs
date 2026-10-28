@@ -8,7 +8,9 @@ pub struct FileHandleNetworkAttachment {
 impl FileHandleNetworkAttachment {
     /// Creates a network attachment from a connected datagram socket fd.
     /// The fd should be one end of `socketpair(AF_UNIX, SOCK_DGRAM)`.
-    pub fn new(fd: RawFd) -> Self {
+    /// `mtu` is accepted for API parity with the Darwin implementation
+    /// and ignored on this platform (Linux build is a stub).
+    pub fn new(fd: RawFd, _mtu: i64) -> Self {
         FileHandleNetworkAttachment { fd }
     }
 }
@@ -25,7 +27,7 @@ impl MACAddress {
     /// Generate a random locally-administered MAC address.
     pub fn random_local() -> Self {
         let mut bytes = [0u8; 6];
-        let fd = unsafe { libc::open(b"/dev/urandom\0".as_ptr() as *const _, libc::O_RDONLY) };
+        let fd = unsafe { libc::open(c"/dev/urandom".as_ptr(), libc::O_RDONLY) };
         if fd >= 0 {
             unsafe {
                 libc::read(fd, bytes.as_mut_ptr() as *mut libc::c_void, 6);

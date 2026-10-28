@@ -1,26 +1,45 @@
+use std::io;
 use std::os::fd::{AsRawFd, RawFd};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{fence, AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
-use kvm_ioctls::VmFd;
-use vm_memory::{Address, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
+use kvm_ioctls::{IoEventAddress, VmFd};
+use vm_memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
 use vmm_sys_util::eventfd::EventFd;
 
 use super::layout;
 
 // ===========================================================================
-// MMIO device trait + bus
+// MMIO device traits + bus
 // ===========================================================================
 
+/// A device whose registers are guarded as a whole.
 pub trait MmioDevice: Send {
     fn read(&mut self, offset: u64, data: &mut [u8]);
     fn write(&mut self, offset: u64, data: &[u8]);
 }
 
+/// What the bus dispatches to. Every device does its own locking, so vCPUs
+/// touching different devices never wait on each other.
+pub trait MmioHandler: Send + Sync {
+    fn read(&self, offset: u64, data: &mut [u8]);
+    fn write(&self, offset: u64, data: &[u8]);
+}
+
+impl<T: MmioDevice> MmioHandler for Mutex<T> {
+    fn read(&self, offset: u64, data: &mut [u8]) {
+        self.lock().unwrap().read(offset, data);
+    }
+
+    fn write(&self, offset: u64, data: &[u8]) {
+        self.lock().unwrap().write(offset, data);
+    }
+}
+
 pub struct MmioEntry {
     pub base: u64,
     pub size: u64,
-    pub device: Box<dyn MmioDevice>,
+    pub device: Box<dyn MmioHandler>,
 }
 
 pub struct MmioBus {
@@ -34,12 +53,12 @@ impl MmioBus {
         }
     }
 
-    pub fn add(&mut self, base: u64, size: u64, device: Box<dyn MmioDevice>) {
+    pub fn add(&mut self, base: u64, size: u64, device: Box<dyn MmioHandler>) {
         self.devices.push(MmioEntry { base, size, device });
     }
 
-    pub fn handle_read(&mut self, addr: u64, data: &mut [u8]) {
-        for entry in &mut self.devices {
+    pub fn handle_read(&self, addr: u64, data: &mut [u8]) {
+        for entry in &self.devices {
             if addr >= entry.base && addr < entry.base + entry.size {
                 entry.device.read(addr - entry.base, data);
                 return;
@@ -50,8 +69,8 @@ impl MmioBus {
         }
     }
 
-    pub fn handle_write(&mut self, addr: u64, data: &[u8]) {
-        for entry in &mut self.devices {
+    pub fn handle_write(&self, addr: u64, data: &[u8]) {
+        for entry in &self.devices {
             if addr >= entry.base && addr < entry.base + entry.size {
                 entry.device.write(addr - entry.base, data);
                 return;
@@ -284,6 +303,11 @@ const VIRTIO_MMIO_CONFIG: u64 = 0x100;
 
 const VIRTIO_STATUS_FEATURES_OK: u32 = 8;
 const VIRTIO_STATUS_DRIVER_OK: u32 = 4;
+const VRING_AVAIL_F_NO_INTERRUPT: u16 = 1;
+
+/// Upper bound for every device's queue size, so chain walks can track
+/// visited descriptors in a fixed array.
+const MAX_QUEUE_SIZE: u16 = 256;
 
 #[derive(Clone)]
 pub struct VirtioQueueState {
@@ -298,6 +322,7 @@ pub struct VirtioQueueState {
 
 impl VirtioQueueState {
     fn new(max_size: u16) -> Self {
+        assert!(max_size <= MAX_QUEUE_SIZE);
         VirtioQueueState {
             max_size,
             size: 0,
@@ -306,6 +331,106 @@ impl VirtioQueueState {
             avail_addr: 0,
             used_addr: 0,
             last_avail_idx: 0,
+        }
+    }
+
+    /// The avail index to process up to, or None when the queue is not set
+    /// up in a way the device can use: size outside 1..=max_size, rings
+    /// outside guest memory, or an avail index more than one ring ahead.
+    pub fn pending(&self, mem: &GuestMemoryMmap) -> Option<u16> {
+        if !self.ready || self.size == 0 || self.size > self.max_size {
+            return None;
+        }
+        let size = self.size as usize;
+        if !mem.check_range(GuestAddress(self.desc_addr), size * 16)
+            || !mem.check_range(GuestAddress(self.avail_addr), 6 + size * 2)
+            || !mem.check_range(GuestAddress(self.used_addr), 6 + size * 8)
+        {
+            return None;
+        }
+        let current = avail_idx(mem, self.avail_addr);
+        if current.wrapping_sub(self.last_avail_idx) > self.size {
+            return None;
+        }
+        Some(current)
+    }
+
+    /// The descriptors of the chain at `head`, or None if it leaves the
+    /// table, loops, or carries a flag outside `flags`. Only valid after
+    /// `pending` accepted the queue.
+    pub(super) fn chain(
+        &self,
+        mem: &GuestMemoryMmap,
+        head: u16,
+        flags: u16,
+    ) -> Option<Vec<VringDesc>> {
+        let mut chain = Vec::new();
+        let mut seen = [false; MAX_QUEUE_SIZE as usize];
+        let mut next = head;
+        loop {
+            if next >= self.size || seen[next as usize] {
+                return None;
+            }
+            seen[next as usize] = true;
+            let desc = read_desc(mem, self.desc_addr, next);
+            if desc.flags & !flags != 0 {
+                return None;
+            }
+            chain.push(desc);
+            if desc.flags & VRING_DESC_F_NEXT == 0 {
+                return Some(chain);
+            }
+            next = desc.next;
+        }
+    }
+
+    /// Whether the driver wants an interrupt for buffers put on this used ring.
+    pub fn wants_interrupt(&self, mem: &GuestMemoryMmap) -> bool {
+        // The used index must be visible to the driver before its flag is read.
+        fence(Ordering::SeqCst);
+        mem.read_obj::<u16>(GuestAddress(self.avail_addr))
+            .map_or(true, |flags| {
+                u16::from_le(flags) & VRING_AVAIL_F_NO_INTERRUPT == 0
+            })
+    }
+}
+
+pub const INTERRUPT_USED: u32 = 1;
+pub const INTERRUPT_CONFIG: u32 = 2;
+
+/// A device interrupt line and the status register that says why it fired.
+/// Both change under one lock so an acknowledgement cannot lower the line
+/// over a reason raised in the meantime.
+pub struct Interrupt {
+    vm_fd: Arc<VmFd>,
+    irq: u32,
+    status: Mutex<u32>,
+}
+
+impl Interrupt {
+    fn new(vm_fd: Arc<VmFd>, irq: u32) -> Self {
+        Interrupt {
+            vm_fd,
+            irq,
+            status: Mutex::new(0),
+        }
+    }
+
+    pub fn raise(&self, reason: u32) {
+        let mut status = self.status.lock().unwrap();
+        *status |= reason;
+        let _ = self.vm_fd.set_irq_line(self.irq, true);
+    }
+
+    fn status(&self) -> u32 {
+        *self.status.lock().unwrap()
+    }
+
+    fn ack(&self, reasons: u32) {
+        let mut status = self.status.lock().unwrap();
+        *status &= !reasons;
+        if *status == 0 {
+            let _ = self.vm_fd.set_irq_line(self.irq, false);
         }
     }
 }
@@ -317,70 +442,42 @@ pub trait VirtioBackend: Send {
     fn queue_max_size(&self) -> u16;
     fn config_read(&self, offset: u64) -> u32;
     fn config_write(&mut self, offset: u64, value: u32);
+    /// The feature set the driver accepted, once it sets FEATURES_OK.
+    fn features_ok(&mut self, _features: u64) {}
     fn activate(
         &mut self,
         queues: &[VirtioQueueState],
         mem: &GuestMemoryMmap,
-        vm_fd: &Arc<VmFd>,
-        irq: u32,
-        interrupt_status: Arc<AtomicU32>,
+        interrupt: Arc<Interrupt>,
     );
+    /// Returns whether any buffer went onto a used ring.
     fn process_queue(
         &mut self,
         queue_idx: u16,
         queues: &mut [VirtioQueueState],
         mem: &GuestMemoryMmap,
-        vm_fd: &Arc<VmFd>,
-        irq: u32,
-    );
+    ) -> bool;
+    /// A backend with a worker of its own takes the queue kicks, one per
+    /// queue in queue order, and the transport leaves its queues alone.
+    fn take_kicks(&mut self, _kicks: &[EventFd]) -> io::Result<bool> {
+        Ok(false)
+    }
     fn reset(&mut self);
 }
 
-pub struct VirtioMmioDevice {
+struct Core {
     backend: Box<dyn VirtioBackend>,
     queues: Vec<VirtioQueueState>,
+    mem: GuestMemoryMmap,
     dev_features_sel: u32,
     drv_features: u64,
     drv_features_sel: u32,
     queue_sel: u32,
     status: u32,
-    interrupt_status: Arc<AtomicU32>,
-    vm_fd: Arc<VmFd>,
-    mem: GuestMemoryMmap,
-    irq: u32,
     activated: bool,
 }
 
-impl VirtioMmioDevice {
-    pub fn new(
-        backend: Box<dyn VirtioBackend>,
-        spi: u32,
-        vm_fd: Arc<VmFd>,
-        mem: GuestMemoryMmap,
-    ) -> Self {
-        let queue_count = backend.queue_count();
-        let queue_max = backend.queue_max_size();
-        let queues = (0..queue_count)
-            .map(|_| VirtioQueueState::new(queue_max))
-            .collect();
-
-        VirtioMmioDevice {
-            backend,
-            queues,
-            dev_features_sel: 0,
-            drv_features: 0,
-            drv_features_sel: 0,
-            queue_sel: 0,
-            status: 0,
-            interrupt_status: Arc::new(AtomicU32::new(0)),
-            vm_fd,
-            mem,
-            // KVM_IRQ_LINE on ARM: SPI N maps to intid N+32
-            irq: layout::spi_to_irq(spi),
-            activated: false,
-        }
-    }
-
+impl Core {
     fn selected_queue(&self) -> Option<&VirtioQueueState> {
         self.queues.get(self.queue_sel as usize)
     }
@@ -390,131 +487,283 @@ impl VirtioMmioDevice {
     }
 }
 
-impl MmioDevice for VirtioMmioDevice {
-    fn read(&mut self, offset: u64, data: &mut [u8]) {
-        let val: u32 = match offset {
-            VIRTIO_MMIO_MAGIC => 0x7472_6976,
-            VIRTIO_MMIO_VERSION => 2,
-            VIRTIO_MMIO_DEVICE_ID => self.backend.device_id(),
-            VIRTIO_MMIO_VENDOR_ID => 0x554D_4551,
-            VIRTIO_MMIO_DEV_FEATURES => {
-                let features = self.backend.device_features();
-                if self.dev_features_sel == 0 {
-                    features as u32
-                } else {
-                    (features >> 32) as u32
-                }
+/// Guest kicks land on an eventfd per queue inside KVM, so a kick never
+/// leaves the kernel and never holds up the vCPU that made it. The queues
+/// are served by the backend worker or by a thread per device.
+pub struct VirtioMmioDevice {
+    core: Arc<Mutex<Core>>,
+    interrupt: Arc<Interrupt>,
+    vm_fd: Arc<VmFd>,
+    notify: IoEventAddress,
+    kicks: Vec<EventFd>,
+    stop: EventFd,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl VirtioMmioDevice {
+    pub fn new(
+        backend: Box<dyn VirtioBackend>,
+        base: u64,
+        spi: u32,
+        vm_fd: Arc<VmFd>,
+        mem: GuestMemoryMmap,
+    ) -> io::Result<Self> {
+        let queue_count = backend.queue_count();
+        let queue_max = backend.queue_max_size();
+        let mut device = VirtioMmioDevice {
+            core: Arc::new(Mutex::new(Core {
+                backend,
+                queues: (0..queue_count)
+                    .map(|_| VirtioQueueState::new(queue_max))
+                    .collect(),
+                mem,
+                dev_features_sel: 0,
+                drv_features: 0,
+                drv_features_sel: 0,
+                queue_sel: 0,
+                status: 0,
+                activated: false,
+            })),
+            // KVM_IRQ_LINE on ARM: SPI N maps to intid N+32
+            interrupt: Arc::new(Interrupt::new(vm_fd.clone(), layout::spi_to_irq(spi))),
+            vm_fd,
+            notify: IoEventAddress::Mmio(base + VIRTIO_MMIO_QUEUE_NOTIFY),
+            kicks: Vec::with_capacity(queue_count),
+            stop: EventFd::new(libc::EFD_CLOEXEC)?,
+            worker: None,
+        };
+        for index in 0..queue_count {
+            let kick = EventFd::new(libc::EFD_NONBLOCK | libc::EFD_CLOEXEC)?;
+            device
+                .vm_fd
+                .register_ioevent(&kick, &device.notify, index as u32)
+                .map_err(io::Error::other)?;
+            device.kicks.push(kick);
+        }
+        let owned = device
+            .core
+            .lock()
+            .unwrap()
+            .backend
+            .take_kicks(&device.kicks)?;
+        if !owned {
+            let kicks = device
+                .kicks
+                .iter()
+                .map(EventFd::try_clone)
+                .collect::<io::Result<Vec<_>>>()?;
+            let stop = device.stop.try_clone()?;
+            let core = device.core.clone();
+            let interrupt = device.interrupt.clone();
+            device.worker = Some(
+                std::thread::Builder::new()
+                    .name("shuru-virtio".into())
+                    .spawn(move || serve(core, interrupt, kicks, stop))?,
+            );
+        }
+        Ok(device)
+    }
+
+    fn kick_all(&self) {
+        for kick in &self.kicks {
+            let _ = kick.write(1);
+        }
+    }
+}
+
+fn serve(core: Arc<Mutex<Core>>, interrupt: Arc<Interrupt>, kicks: Vec<EventFd>, stop: EventFd) {
+    let mut fds: Vec<libc::pollfd> = std::iter::once(&stop)
+        .chain(&kicks)
+        .map(|event| libc::pollfd {
+            fd: event.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        })
+        .collect();
+    loop {
+        let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
+        if n < 0 {
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
             }
-            VIRTIO_MMIO_QUEUE_NUM_MAX => self.selected_queue().map_or(0, |q| q.max_size as u32),
-            VIRTIO_MMIO_QUEUE_READY => self.selected_queue().map_or(0, |q| q.ready as u32),
-            VIRTIO_MMIO_INTERRUPT_STATUS => self.interrupt_status.load(Ordering::Acquire),
-            VIRTIO_MMIO_STATUS => self.status,
-            VIRTIO_MMIO_CONFIG_GENERATION => 0,
-            o if o >= VIRTIO_MMIO_CONFIG => self.backend.config_read(o - VIRTIO_MMIO_CONFIG),
-            _ => 0,
+            return;
+        }
+        if fds[0].revents != 0 {
+            return;
+        }
+        for (index, kick) in kicks.iter().enumerate() {
+            if fds[index + 1].revents & libc::POLLIN == 0 {
+                continue;
+            }
+            let _ = kick.read();
+            let mut core = core.lock().unwrap();
+            let Core {
+                backend,
+                queues,
+                mem,
+                activated,
+                ..
+            } = &mut *core;
+            if *activated
+                && backend.process_queue(index as u16, queues, mem)
+                && queues[index].wants_interrupt(mem)
+            {
+                interrupt.raise(INTERRUPT_USED);
+            }
+        }
+    }
+}
+
+impl Drop for VirtioMmioDevice {
+    fn drop(&mut self) {
+        let _ = self.stop.write(1);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+        for (index, kick) in self.kicks.iter().enumerate() {
+            let _ = self
+                .vm_fd
+                .unregister_ioevent(kick, &self.notify, index as u32);
+        }
+    }
+}
+
+impl MmioHandler for VirtioMmioDevice {
+    fn read(&self, offset: u64, data: &mut [u8]) {
+        let val: u32 = if offset == VIRTIO_MMIO_INTERRUPT_STATUS {
+            self.interrupt.status()
+        } else {
+            let core = self.core.lock().unwrap();
+            match offset {
+                VIRTIO_MMIO_MAGIC => 0x7472_6976,
+                VIRTIO_MMIO_VERSION => 2,
+                VIRTIO_MMIO_DEVICE_ID => core.backend.device_id(),
+                VIRTIO_MMIO_VENDOR_ID => 0x554D_4551,
+                VIRTIO_MMIO_DEV_FEATURES => {
+                    let features = core.backend.device_features();
+                    if core.dev_features_sel == 0 {
+                        features as u32
+                    } else {
+                        (features >> 32) as u32
+                    }
+                }
+                VIRTIO_MMIO_QUEUE_NUM_MAX => core.selected_queue().map_or(0, |q| q.max_size as u32),
+                VIRTIO_MMIO_QUEUE_READY => core.selected_queue().map_or(0, |q| q.ready as u32),
+                VIRTIO_MMIO_STATUS => core.status,
+                VIRTIO_MMIO_CONFIG_GENERATION => 0,
+                o if o >= VIRTIO_MMIO_CONFIG => core.backend.config_read(o - VIRTIO_MMIO_CONFIG),
+                _ => 0,
+            }
         };
         let len = data.len().min(4);
         data[..len].copy_from_slice(&val.to_le_bytes()[..len]);
     }
 
-    fn write(&mut self, offset: u64, data: &[u8]) {
+    fn write(&self, offset: u64, data: &[u8]) {
         let mut bytes = [0u8; 4];
         let len = data.len().min(4);
         bytes[..len].copy_from_slice(&data[..len]);
         let val = u32::from_le_bytes(bytes);
 
         match offset {
-            VIRTIO_MMIO_DEV_FEATURES_SEL => self.dev_features_sel = val,
+            VIRTIO_MMIO_INTERRUPT_ACK => return self.interrupt.ack(val),
+            // Matching kicks never get here; KVM signals the eventfd itself.
+            VIRTIO_MMIO_QUEUE_NOTIFY => return,
+            _ => {}
+        }
+
+        let mut core = self.core.lock().unwrap();
+        match offset {
+            VIRTIO_MMIO_DEV_FEATURES_SEL => core.dev_features_sel = val,
             VIRTIO_MMIO_DRV_FEATURES => {
-                if self.drv_features_sel == 0 {
-                    self.drv_features = (self.drv_features & 0xFFFF_FFFF_0000_0000) | val as u64;
+                if core.drv_features_sel == 0 {
+                    core.drv_features = (core.drv_features & 0xFFFF_FFFF_0000_0000) | val as u64;
                 } else {
-                    self.drv_features =
-                        (self.drv_features & 0x0000_0000_FFFF_FFFF) | ((val as u64) << 32);
+                    core.drv_features =
+                        (core.drv_features & 0x0000_0000_FFFF_FFFF) | ((val as u64) << 32);
                 }
             }
-            VIRTIO_MMIO_DRV_FEATURES_SEL => self.drv_features_sel = val,
-            VIRTIO_MMIO_QUEUE_SEL => self.queue_sel = val,
+            VIRTIO_MMIO_DRV_FEATURES_SEL => core.drv_features_sel = val,
+            VIRTIO_MMIO_QUEUE_SEL => core.queue_sel = val,
             VIRTIO_MMIO_QUEUE_NUM => {
-                if let Some(q) = self.selected_queue_mut() {
-                    q.size = val as u16;
+                if let Some(q) = core.selected_queue_mut() {
+                    q.size = if (1..=q.max_size as u32).contains(&val) {
+                        val as u16
+                    } else {
+                        0
+                    };
                 }
             }
             VIRTIO_MMIO_QUEUE_READY => {
-                if let Some(q) = self.selected_queue_mut() {
+                if let Some(q) = core.selected_queue_mut() {
                     q.ready = val == 1;
                 }
             }
-            VIRTIO_MMIO_QUEUE_NOTIFY => {
-                self.backend.process_queue(
-                    val as u16,
-                    &mut self.queues,
-                    &self.mem,
-                    &self.vm_fd,
-                    self.irq,
-                );
-                self.interrupt_status.fetch_or(1, Ordering::Release);
-                let _ = self.vm_fd.set_irq_line(self.irq, true);
-            }
-            VIRTIO_MMIO_INTERRUPT_ACK => {
-                self.interrupt_status.fetch_and(!val, Ordering::AcqRel);
-                if self.interrupt_status.load(Ordering::Acquire) == 0 {
-                    let _ = self.vm_fd.set_irq_line(self.irq, false);
-                }
-            }
             VIRTIO_MMIO_STATUS => {
-                self.status = val;
+                let prev = core.status;
+                core.status = val;
                 if val == 0 {
-                    self.backend.reset();
-                    self.activated = false;
-                    self.interrupt_status.store(0, Ordering::Release);
+                    core.backend.reset();
+                    core.activated = false;
+                    for q in &mut core.queues {
+                        *q = VirtioQueueState::new(q.max_size);
+                    }
+                    self.interrupt.ack(u32::MAX);
                 }
-                if !self.activated
+                if (val & VIRTIO_STATUS_FEATURES_OK) != 0 && (prev & VIRTIO_STATUS_FEATURES_OK) == 0
+                {
+                    let features = core.drv_features & core.backend.device_features();
+                    core.backend.features_ok(features);
+                }
+                if !core.activated
                     && (val & VIRTIO_STATUS_DRIVER_OK) != 0
                     && (val & VIRTIO_STATUS_FEATURES_OK) != 0
                 {
-                    self.activated = true;
-                    self.backend.activate(
-                        &self.queues,
-                        &self.mem,
-                        &self.vm_fd,
-                        self.irq,
-                        self.interrupt_status.clone(),
-                    );
+                    core.activated = true;
+                    let Core {
+                        backend,
+                        queues,
+                        mem,
+                        ..
+                    } = &mut *core;
+                    backend.activate(queues, mem, self.interrupt.clone());
+                    drop(core);
+                    // Anything queued before the driver finished setting up.
+                    self.kick_all();
                 }
             }
             VIRTIO_MMIO_QUEUE_DESC_LOW => {
-                if let Some(q) = self.selected_queue_mut() {
+                if let Some(q) = core.selected_queue_mut() {
                     q.desc_addr = (q.desc_addr & !0xFFFF_FFFF) | val as u64;
                 }
             }
             VIRTIO_MMIO_QUEUE_DESC_HIGH => {
-                if let Some(q) = self.selected_queue_mut() {
+                if let Some(q) = core.selected_queue_mut() {
                     q.desc_addr = (q.desc_addr & 0xFFFF_FFFF) | ((val as u64) << 32);
                 }
             }
             VIRTIO_MMIO_QUEUE_DRIVER_LOW => {
-                if let Some(q) = self.selected_queue_mut() {
+                if let Some(q) = core.selected_queue_mut() {
                     q.avail_addr = (q.avail_addr & !0xFFFF_FFFF) | val as u64;
                 }
             }
             VIRTIO_MMIO_QUEUE_DRIVER_HIGH => {
-                if let Some(q) = self.selected_queue_mut() {
+                if let Some(q) = core.selected_queue_mut() {
                     q.avail_addr = (q.avail_addr & 0xFFFF_FFFF) | ((val as u64) << 32);
                 }
             }
             VIRTIO_MMIO_QUEUE_DEVICE_LOW => {
-                if let Some(q) = self.selected_queue_mut() {
+                if let Some(q) = core.selected_queue_mut() {
                     q.used_addr = (q.used_addr & !0xFFFF_FFFF) | val as u64;
                 }
             }
             VIRTIO_MMIO_QUEUE_DEVICE_HIGH => {
-                if let Some(q) = self.selected_queue_mut() {
+                if let Some(q) = core.selected_queue_mut() {
                     q.used_addr = (q.used_addr & 0xFFFF_FFFF) | ((val as u64) << 32);
                 }
             }
             o if o >= VIRTIO_MMIO_CONFIG => {
-                self.backend.config_write(o - VIRTIO_MMIO_CONFIG, val);
+                core.backend.config_write(o - VIRTIO_MMIO_CONFIG, val);
             }
             _ => {}
         }
@@ -525,20 +774,24 @@ impl MmioDevice for VirtioMmioDevice {
 // Virtio descriptor chain helpers
 // ===========================================================================
 
-const VRING_DESC_F_NEXT: u16 = 1;
-const VRING_DESC_F_WRITE: u16 = 2;
+pub(super) const VRING_DESC_F_NEXT: u16 = 1;
+pub(super) const VRING_DESC_F_WRITE: u16 = 2;
 
 #[derive(Clone, Copy)]
-struct VringDesc {
-    addr: u64,
-    len: u32,
-    flags: u16,
-    next: u16,
+pub(super) struct VringDesc {
+    pub(super) addr: u64,
+    pub(super) len: u32,
+    pub(super) flags: u16,
+    pub(super) next: u16,
 }
 
 pub fn avail_idx(mem: &GuestMemoryMmap, avail_addr: u64) -> u16 {
-    mem.read_obj::<u16>(GuestAddress(avail_addr + 2))
-        .unwrap_or(0)
+    let idx = mem
+        .read_obj::<u16>(GuestAddress(avail_addr + 2))
+        .unwrap_or(0);
+    // Ring entries the index covers must not be read before the index.
+    fence(Ordering::Acquire);
+    idx
 }
 
 pub fn avail_ring_entry(mem: &GuestMemoryMmap, avail_addr: u64, queue_size: u16, idx: u16) -> u16 {
@@ -547,7 +800,7 @@ pub fn avail_ring_entry(mem: &GuestMemoryMmap, avail_addr: u64, queue_size: u16,
         .unwrap_or(0)
 }
 
-fn read_desc(mem: &GuestMemoryMmap, desc_addr: u64, idx: u16) -> VringDesc {
+pub(super) fn read_desc(mem: &GuestMemoryMmap, desc_addr: u64, idx: u16) -> VringDesc {
     let off = idx as u64 * 16;
     VringDesc {
         addr: mem.read_obj(GuestAddress(desc_addr + off)).unwrap_or(0),
@@ -572,6 +825,7 @@ pub fn write_used(
     let ring_off = 4 + (used_idx % queue_size) as u64 * 8;
     let _ = mem.write_obj(desc_id, GuestAddress(used_addr + ring_off));
     let _ = mem.write_obj(len, GuestAddress(used_addr + ring_off + 4));
+    fence(Ordering::Release);
     let _ = mem.write_obj(used_idx.wrapping_add(1), GuestAddress(used_addr + 2));
 }
 
@@ -579,32 +833,133 @@ pub fn write_used(
 // Virtio block backend (device ID 2)
 // ===========================================================================
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 
-const VIRTIO_BLK_T_IN: u32 = 0;
-const VIRTIO_BLK_T_OUT: u32 = 1;
-const VIRTIO_BLK_S_OK: u8 = 0;
-const VIRTIO_BLK_S_IOERR: u8 = 1;
-const VIRTIO_F_VERSION_1: u64 = 1 << 32;
+#[path = "block_ranges.rs"]
+mod block_ranges;
+use block_ranges::*;
+pub(super) const VIRTIO_F_VERSION_1: u64 = 1 << 32;
 
 pub struct BlockBackend {
     disk: File,
     capacity: u64,
     read_only: bool,
+    negotiated: u64,
     buf: Vec<u8>,
 }
 
 impl BlockBackend {
-    pub fn new(path: &str, read_only: bool) -> std::io::Result<Self> {
-        let disk = OpenOptions::new().read(true).write(!read_only).open(path)?;
+    pub fn new(disk: File, read_only: bool) -> std::io::Result<Self> {
         let capacity = disk.metadata()?.len() / 512;
         Ok(BlockBackend {
             disk,
             capacity,
             read_only,
+            negotiated: 0,
             buf: vec![0u8; 65536],
         })
+    }
+    fn request(&mut self, mem: &GuestMemoryMmap, chain: &[VringDesc]) -> Result<u32, u8> {
+        let fail = VIRTIO_BLK_S_IOERR;
+        if chain.len() < 2 {
+            return Err(fail);
+        }
+        let header = &chain[0];
+        if header.len != 16 || header.flags & VRING_DESC_F_WRITE != 0 {
+            return Err(fail);
+        }
+        let mut bytes = [0; 16];
+        mem.read_slice(&mut bytes, GuestAddress(header.addr))
+            .map_err(|_| fail)?;
+        let kind = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+        let sector = u64::from_le_bytes(bytes[8..].try_into().unwrap());
+        let data = &chain[1..chain.len() - 1];
+        let mut total = 0usize;
+        for desc in data {
+            if (desc.flags & VRING_DESC_F_WRITE != 0) != (kind == VIRTIO_BLK_T_IN) {
+                return Err(fail);
+            }
+            if desc.len > 1024 * 1024
+                || !mem.check_range(GuestAddress(desc.addr), desc.len as usize)
+            {
+                return Err(fail);
+            }
+            total = total.checked_add(desc.len as usize).ok_or(fail)?;
+        }
+        match kind {
+            VIRTIO_BLK_T_DISCARD | VIRTIO_BLK_T_WRITE_ZEROES => {
+                if self.read_only
+                    || total == 0
+                    || total > MAX_RANGES * 16
+                    || !total.is_multiple_of(16)
+                    || sector != 0
+                {
+                    return Err(fail);
+                }
+                let feature = if kind == VIRTIO_BLK_T_DISCARD { 13 } else { 14 };
+                if self.negotiated & (1 << feature) == 0 {
+                    return Err(VIRTIO_BLK_S_UNSUPP);
+                }
+                let mut payload = [0u8; MAX_RANGES * 16];
+                let mut at = 0;
+                for desc in data {
+                    let end = at + desc.len as usize;
+                    mem.read_slice(&mut payload[at..end], GuestAddress(desc.addr))
+                        .map_err(|_| fail)?;
+                    at = end;
+                }
+                let ranges = decode_ranges(&payload[..total], self.capacity, kind)?;
+                for (offset, len, unmap) in ranges {
+                    if len == 0 {
+                        continue;
+                    }
+                    let mode = if kind == VIRTIO_BLK_T_DISCARD || unmap {
+                        libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE
+                    } else {
+                        libc::FALLOC_FL_ZERO_RANGE | libc::FALLOC_FL_KEEP_SIZE
+                    };
+                    if unsafe { libc::fallocate(self.disk.as_raw_fd(), mode, offset, len) } < 0 {
+                        return Err(fail);
+                    }
+                }
+                Ok(0)
+            }
+            VIRTIO_BLK_T_IN | VIRTIO_BLK_T_OUT => {
+                if kind == VIRTIO_BLK_T_OUT && self.read_only {
+                    return Err(fail);
+                }
+                if !total.is_multiple_of(512)
+                    || sector > self.capacity
+                    || total as u64 / 512 > self.capacity - sector
+                {
+                    return Err(fail);
+                }
+                self.disk
+                    .seek(SeekFrom::Start(sector.checked_mul(512).ok_or(fail)?))
+                    .map_err(|_| fail)?;
+                let mut written = 0;
+                for desc in data {
+                    let mut at = 0usize;
+                    while at < desc.len as usize {
+                        let n = self.buf.len().min(desc.len as usize - at);
+                        let buf = &mut self.buf[..n];
+                        let addr = GuestAddress(desc.addr.checked_add(at as u64).ok_or(fail)?);
+                        if kind == VIRTIO_BLK_T_IN {
+                            self.disk.read_exact(buf).map_err(|_| fail)?;
+                            mem.write_slice(buf, addr).map_err(|_| fail)?;
+                            written += n as u32;
+                        } else {
+                            mem.read_slice(buf, addr).map_err(|_| fail)?;
+                            self.disk.write_all(buf).map_err(|_| fail)?;
+                        }
+                        at += n;
+                    }
+                }
+                Ok(written)
+            }
+            _ => Err(VIRTIO_BLK_S_UNSUPP),
+        }
     }
 }
 
@@ -614,9 +969,11 @@ impl VirtioBackend for BlockBackend {
     }
 
     fn device_features(&self) -> u64 {
-        let mut f = VIRTIO_F_VERSION_1;
+        let mut f = VIRTIO_F_VERSION_1 | (1 << 1) | (1 << 2);
         if self.read_only {
             f |= 1 << 5;
+        } else {
+            f |= (1 << 13) | (1 << 14);
         }
         f
     }
@@ -632,102 +989,62 @@ impl VirtioBackend for BlockBackend {
         match offset {
             0 => self.capacity as u32,
             4 => (self.capacity >> 32) as u32,
+            8 => 1024 * 1024,
+            12 => 254,
+            36 | 48 if !self.read_only => MAX_RANGE_SECTORS,
+            40 | 52 if !self.read_only => MAX_RANGES as u32,
+            44 if !self.read_only => 8,
+            56 if !self.read_only => 1,
             _ => 0,
         }
     }
 
     fn config_write(&mut self, _: u64, _: u32) {}
 
-    fn activate(
-        &mut self,
-        _: &[VirtioQueueState],
-        _: &GuestMemoryMmap,
-        _: &Arc<VmFd>,
-        _: u32,
-        _: Arc<AtomicU32>,
-    ) {
+    fn features_ok(&mut self, features: u64) {
+        self.negotiated = features;
     }
+
+    fn activate(&mut self, _: &[VirtioQueueState], _: &GuestMemoryMmap, _: Arc<Interrupt>) {}
 
     fn process_queue(
         &mut self,
         _queue_idx: u16,
         queues: &mut [VirtioQueueState],
         mem: &GuestMemoryMmap,
-        _vm_fd: &Arc<VmFd>,
-        _irq: u32,
-    ) {
+    ) -> bool {
         let q = match queues.get_mut(0) {
-            Some(q) if q.ready => q,
-            _ => return,
+            Some(q) => q,
+            None => return false,
         };
-
-        let current_avail = avail_idx(mem, q.avail_addr);
-
+        let current_avail = match q.pending(mem) {
+            Some(idx) => idx,
+            None => return false,
+        };
+        let used = q.last_avail_idx != current_avail;
         while q.last_avail_idx != current_avail {
             let head = avail_ring_entry(mem, q.avail_addr, q.size, q.last_avail_idx);
-
-            let header_desc = read_desc(mem, q.desc_addr, head);
-            let req_type = mem
-                .read_obj::<u32>(GuestAddress(header_desc.addr))
-                .unwrap_or(u32::MAX);
-            let sector = mem
-                .read_obj::<u64>(GuestAddress(header_desc.addr + 8))
-                .unwrap_or(0);
-
-            // Walk the descriptor chain inline — no Vec allocation.
-            // Chain: header → data desc(s) → status (last, no NEXT flag).
-            let mut disk_offset = sector * 512;
-            let mut total_data_len: u32 = 0;
-            let mut status = VIRTIO_BLK_S_OK;
-            let mut status_addr: Option<u64> = None;
-            let mut next = header_desc.next;
-            let mut has_next = header_desc.flags & VRING_DESC_F_NEXT != 0;
-
-            while has_next {
-                let desc = read_desc(mem, q.desc_addr, next);
-                let is_last = desc.flags & VRING_DESC_F_NEXT == 0;
-
-                if is_last {
-                    status_addr = Some(desc.addr);
-                } else if status == VIRTIO_BLK_S_OK {
-                    let len = desc.len as usize;
-                    if self.buf.len() < len {
-                        self.buf.resize(len, 0);
+            let chain = q
+                .chain(mem, head, VRING_DESC_F_NEXT | VRING_DESC_F_WRITE)
+                .unwrap_or_default();
+            let status_desc = chain.last().filter(|d| {
+                chain.len() >= 2
+                    && d.flags == VRING_DESC_F_WRITE
+                    && d.len >= 1
+                    && mem.check_range(GuestAddress(d.addr), 1)
+            });
+            let mut used_len = 0;
+            if let Some(desc) = status_desc {
+                let result = self.request(mem, &chain);
+                let status = match result {
+                    Ok(n) => {
+                        used_len = n;
+                        VIRTIO_BLK_S_OK
                     }
-                    let buf = &mut self.buf[..len];
-
-                    match req_type {
-                        VIRTIO_BLK_T_IN => {
-                            if self.disk.seek(SeekFrom::Start(disk_offset)).is_err()
-                                || self.disk.read_exact(buf).is_err()
-                            {
-                                status = VIRTIO_BLK_S_IOERR;
-                            } else {
-                                let _ = mem.write_slice(buf, GuestAddress(desc.addr));
-                            }
-                        }
-                        VIRTIO_BLK_T_OUT if !self.read_only => {
-                            if mem.read_slice(buf, GuestAddress(desc.addr)).is_err()
-                                || self.disk.seek(SeekFrom::Start(disk_offset)).is_err()
-                                || self.disk.write_all(buf).is_err()
-                            {
-                                status = VIRTIO_BLK_S_IOERR;
-                            }
-                        }
-                        _ => {
-                            status = VIRTIO_BLK_S_IOERR;
-                        }
-                    }
-                    disk_offset += len as u64;
-                    total_data_len += desc.len;
-                }
-
-                next = desc.next;
-                has_next = !is_last;
-            }
-
-            if let Some(addr) = status_addr {
-                let _ = mem.write_obj(status, GuestAddress(addr));
+                    Err(status) => status,
+                };
+                let _ = mem.write_obj(status, GuestAddress(desc.addr));
+                used_len += 1;
             }
             write_used(
                 mem,
@@ -735,13 +1052,16 @@ impl VirtioBackend for BlockBackend {
                 q.size,
                 q.last_avail_idx,
                 head as u32,
-                total_data_len + 1,
+                used_len,
             );
             q.last_avail_idx = q.last_avail_idx.wrapping_add(1);
         }
+        used
     }
 
-    fn reset(&mut self) {}
+    fn reset(&mut self) {
+        self.negotiated = 0;
+    }
 }
 
 // ===========================================================================
@@ -756,7 +1076,11 @@ pub struct NetBackend {
     mac: [u8; 6],
     rx_running: Arc<AtomicBool>,
     rx_thread: Option<std::thread::JoinHandle<()>>,
+    tx_buf: Vec<u8>,
 }
+
+// The virtio-net header plus one Ethernet frame at the 65535-byte IP MTU.
+const MAX_TX_FRAME: usize = VIRTIO_NET_HDR_SIZE + 14 + 65535;
 
 impl NetBackend {
     pub fn new(fd: RawFd, mac: [u8; 6]) -> Self {
@@ -764,6 +1088,7 @@ impl NetBackend {
             fd,
             mac,
             rx_running: Arc::new(AtomicBool::new(false)),
+            tx_buf: vec![0; MAX_TX_FRAME],
             rx_thread: None,
         }
     }
@@ -799,9 +1124,7 @@ impl VirtioBackend for NetBackend {
         &mut self,
         queues: &[VirtioQueueState],
         mem: &GuestMemoryMmap,
-        vm_fd: &Arc<VmFd>,
-        irq: u32,
-        interrupt_status: Arc<AtomicU32>,
+        interrupt: Arc<Interrupt>,
     ) {
         // Set fd to non-blocking
         unsafe {
@@ -819,13 +1142,12 @@ impl VirtioBackend for NetBackend {
         let running = self.rx_running.clone();
         let fd = self.fd;
         let mem = mem.clone();
-        let vm_fd = vm_fd.clone();
 
         self.rx_thread = Some(
             std::thread::Builder::new()
                 .name("shuru-net-rx".into())
                 .spawn(move || {
-                    net_rx_loop(fd, mem, rx_q, vm_fd, irq, interrupt_status, running);
+                    net_rx_loop(fd, mem, rx_q, interrupt, running);
                 })
                 .expect("failed to spawn net-rx thread"),
         );
@@ -836,36 +1158,41 @@ impl VirtioBackend for NetBackend {
         queue_idx: u16,
         queues: &mut [VirtioQueueState],
         mem: &GuestMemoryMmap,
-        _vm_fd: &Arc<VmFd>,
-        _irq: u32,
-    ) {
+    ) -> bool {
         if queue_idx != 1 {
-            return; // RX handled by thread
+            return false; // RX handled by thread
         }
         let q = match queues.get_mut(1) {
-            Some(q) if q.ready => q,
-            _ => return,
+            Some(q) => q,
+            None => return false,
         };
-
-        let current_avail = avail_idx(mem, q.avail_addr);
+        let current_avail = match q.pending(mem) {
+            Some(idx) => idx,
+            None => return false,
+        };
+        let used = q.last_avail_idx != current_avail;
         while q.last_avail_idx != current_avail {
             let head = avail_ring_entry(mem, q.avail_addr, q.size, q.last_avail_idx);
 
-            let mut packet = Vec::new();
-            let mut desc = read_desc(mem, q.desc_addr, head);
-            loop {
-                let mut buf = vec![0u8; desc.len as usize];
-                let _ = mem.read_slice(&mut buf, GuestAddress(desc.addr));
-                packet.extend_from_slice(&buf);
-                if desc.flags & VRING_DESC_F_NEXT == 0 {
+            // A chain that loops, is longer than one frame, or points
+            // outside guest memory is dropped.
+            let mut len = 0;
+            for desc in q.chain(mem, head, VRING_DESC_F_NEXT).unwrap_or_default() {
+                let end = len + desc.len as usize;
+                if end > MAX_TX_FRAME
+                    || mem
+                        .read_slice(&mut self.tx_buf[len..end], GuestAddress(desc.addr))
+                        .is_err()
+                {
+                    len = 0;
                     break;
                 }
-                desc = read_desc(mem, q.desc_addr, desc.next);
+                len = end;
             }
 
             // Skip virtio-net header, send raw Ethernet frame
-            if packet.len() > VIRTIO_NET_HDR_SIZE {
-                let frame = &packet[VIRTIO_NET_HDR_SIZE..];
+            if len > VIRTIO_NET_HDR_SIZE {
+                let frame = &self.tx_buf[VIRTIO_NET_HDR_SIZE..len];
                 unsafe {
                     libc::send(
                         self.fd,
@@ -879,6 +1206,7 @@ impl VirtioBackend for NetBackend {
             write_used(mem, q.used_addr, q.size, q.last_avail_idx, head as u32, 0);
             q.last_avail_idx = q.last_avail_idx.wrapping_add(1);
         }
+        used
     }
 
     fn reset(&mut self) {
@@ -900,14 +1228,15 @@ fn net_rx_loop(
     fd: RawFd,
     mem: GuestMemoryMmap,
     rx_q: VirtioQueueState,
-    vm_fd: Arc<VmFd>,
-    irq: u32,
-    interrupt_status: Arc<AtomicU32>,
+    interrupt: Arc<Interrupt>,
     running: Arc<AtomicBool>,
 ) {
     let mut last_avail = rx_q.last_avail_idx;
     let mut used_idx: u16 = 0;
-    let mut buf = vec![0u8; 65535];
+    // One Ethernet frame at the 65535-byte IP-MTU the proxy stack uses:
+    // 14 bytes of header plus the IP payload. A datagram longer than the
+    // buffer would be truncated by recv.
+    let mut buf = vec![0u8; 14 + 65535];
 
     while running.load(Ordering::Acquire) {
         let mut pfd = libc::pollfd {
@@ -927,12 +1256,21 @@ fn net_rx_loop(
         let frame = &buf[..n as usize];
 
         // Check for available RX descriptors
-        let current_avail = avail_idx(&mem, rx_q.avail_addr);
+        let mut ring = rx_q.clone();
+        ring.last_avail_idx = last_avail;
+        let current_avail = match ring.pending(&mem) {
+            Some(idx) => idx,
+            None => continue,
+        };
         if last_avail == current_avail {
             continue; // drop frame — no buffers
         }
 
         let head = avail_ring_entry(&mem, rx_q.avail_addr, rx_q.size, last_avail);
+        if head >= rx_q.size {
+            last_avail = last_avail.wrapping_add(1);
+            continue;
+        }
         let desc = read_desc(&mem, rx_q.desc_addr, head);
 
         let total = VIRTIO_NET_HDR_SIZE + frame.len();
@@ -953,348 +1291,241 @@ fn net_rx_loop(
             used_idx = used_idx.wrapping_add(1);
             last_avail = last_avail.wrapping_add(1);
 
-            // Signal the guest
-            interrupt_status.fetch_or(1, Ordering::Release);
-            let _ = vm_fd.set_irq_line(irq, true);
-        }
-    }
-}
-
-// ===========================================================================
-// Vhost-vsock backend (device ID 19)
-// ===========================================================================
-
-pub struct VhostVsockBackend {
-    guest_cid: u64,
-    vhost_fd: Option<RawFd>,
-    kick_evts: Vec<EventFd>,
-    call_evts: Vec<EventFd>,
-    irq_running: Arc<AtomicBool>,
-    irq_thread: Option<std::thread::JoinHandle<()>>,
-}
-
-impl VhostVsockBackend {
-    pub fn new(guest_cid: u64) -> Self {
-        VhostVsockBackend {
-            guest_cid,
-            vhost_fd: None,
-            kick_evts: Vec::new(),
-            call_evts: Vec::new(),
-            irq_running: Arc::new(AtomicBool::new(false)),
-            irq_thread: None,
-        }
-    }
-}
-
-// Vhost ioctl encoding
-const VHOST_VIRTIO: u64 = 0xAF;
-
-const fn vhost_io(nr: u64) -> u64 {
-    (VHOST_VIRTIO << 8) | nr
-}
-
-const fn vhost_iow_size(nr: u64, size: usize) -> u64 {
-    (1u64 << 30) | ((size as u64) << 16) | (VHOST_VIRTIO << 8) | nr
-}
-
-const VHOST_SET_OWNER: u64 = vhost_io(0x01);
-const VHOST_SET_FEATURES: u64 = vhost_iow_size(0x00, 8); // sizeof(u64)
-const VHOST_SET_MEM_TABLE: u64 = vhost_iow_size(0x03, 8); // sizeof(vhost_memory header)
-const VHOST_SET_VRING_NUM: u64 = vhost_iow_size(0x10, 8); // sizeof(vhost_vring_state)
-const VHOST_SET_VRING_ADDR: u64 = vhost_iow_size(0x11, 40); // sizeof(vhost_vring_addr) = 4+4+8+8+8+8
-const VHOST_SET_VRING_BASE: u64 = vhost_iow_size(0x12, 8);
-const VHOST_SET_VRING_KICK: u64 = vhost_iow_size(0x20, 8); // sizeof(vhost_vring_file)
-const VHOST_SET_VRING_CALL: u64 = vhost_iow_size(0x21, 8);
-const VHOST_VSOCK_SET_GUEST_CID: u64 = vhost_iow_size(0x60, 8);
-// _IOW(0xAF, 0x61, int) — starts/stops the vhost worker
-const VHOST_VSOCK_SET_RUNNING: u64 = vhost_iow_size(0x61, 4);
-
-#[repr(C)]
-struct VhostVringState {
-    index: u32,
-    num: u32,
-}
-
-#[repr(C)]
-struct VhostVringAddr {
-    index: u32,
-    flags: u32,
-    desc_user_addr: u64,
-    used_user_addr: u64,
-    avail_user_addr: u64,
-    log_guest_addr: u64,
-}
-
-#[repr(C)]
-struct VhostVringFile {
-    index: u32,
-    fd: i32,
-}
-
-#[repr(C)]
-struct VhostMemoryHeader {
-    nregions: u32,
-    _padding: u32,
-}
-
-#[repr(C)]
-struct VhostMemoryRegion {
-    guest_phys_addr: u64,
-    memory_size: u64,
-    userspace_addr: u64,
-    _flags_padding: u64,
-}
-
-#[repr(C)]
-struct VhostMemTable {
-    header: VhostMemoryHeader,
-    region: VhostMemoryRegion,
-}
-
-fn guest_to_host(mem: &GuestMemoryMmap, guest_addr: u64) -> u64 {
-    mem.get_host_address(GuestAddress(guest_addr))
-        .map(|p| p as u64)
-        .unwrap_or(0)
-}
-
-impl VirtioBackend for VhostVsockBackend {
-    fn device_id(&self) -> u32 {
-        19
-    }
-
-    fn device_features(&self) -> u64 {
-        VIRTIO_F_VERSION_1
-    }
-
-    fn queue_count(&self) -> usize {
-        3
-    }
-    fn queue_max_size(&self) -> u16 {
-        256
-    }
-
-    fn config_read(&self, offset: u64) -> u32 {
-        match offset {
-            0 => self.guest_cid as u32,
-            4 => (self.guest_cid >> 32) as u32,
-            _ => 0,
-        }
-    }
-
-    fn config_write(&mut self, _: u64, _: u32) {}
-
-    fn activate(
-        &mut self,
-        queues: &[VirtioQueueState],
-        mem: &GuestMemoryMmap,
-        vm_fd: &Arc<VmFd>,
-        irq: u32,
-        _interrupt_status: Arc<AtomicU32>,
-    ) {
-        let vhost_fd = unsafe {
-            libc::open(
-                b"/dev/vhost-vsock\0".as_ptr() as *const libc::c_char,
-                libc::O_RDWR | libc::O_CLOEXEC,
-            )
-        };
-        if vhost_fd < 0 {
-            eprintln!(
-                "shuru: failed to open /dev/vhost-vsock: {}",
-                std::io::Error::last_os_error()
-            );
-            return;
-        }
-        self.vhost_fd = Some(vhost_fd);
-
-        unsafe {
-            // Exact order matching Cloud Hypervisor / Firecracker:
-            // 1. OWNER → 2. FEATURES → 3. MEM_TABLE → 4. queues (NUM, ADDR, BASE, CALL, KICK) → 5. CID → 6. IRQFD
-            if libc::ioctl(vhost_fd, VHOST_SET_OWNER) < 0 {
-                eprintln!(
-                    "shuru: VHOST_SET_OWNER failed: {}",
-                    std::io::Error::last_os_error()
-                );
-                return;
-            }
-
-            // Negotiate features — get supported, intersect, set
-            let get_features: u64 = (2u64 << 30) | (8u64 << 16) | (VHOST_VIRTIO << 8) | 0x00;
-            let mut avail_features: u64 = 0;
-            libc::ioctl(vhost_fd, get_features, &mut avail_features);
-            let features = avail_features & VIRTIO_F_VERSION_1;
-            if libc::ioctl(vhost_fd, VHOST_SET_FEATURES, &features) < 0 {
-                eprintln!(
-                    "shuru: VHOST_SET_FEATURES failed: {}",
-                    std::io::Error::last_os_error()
-                );
-                return;
-            }
-
-            // Memory table
-            let host_addr = guest_to_host(mem, layout::DRAM_BASE);
-            let region = mem.find_region(GuestAddress(layout::DRAM_BASE));
-            if let Some(region) = region {
-                use vm_memory::GuestMemoryRegion;
-                let mem_table = VhostMemTable {
-                    header: VhostMemoryHeader {
-                        nregions: 1,
-                        _padding: 0,
-                    },
-                    region: VhostMemoryRegion {
-                        guest_phys_addr: region.start_addr().raw_value(),
-                        memory_size: region.len(),
-                        userspace_addr: host_addr,
-                        _flags_padding: 0,
-                    },
-                };
-                if libc::ioctl(vhost_fd, VHOST_SET_MEM_TABLE, &mem_table) < 0 {
-                    eprintln!(
-                        "shuru: VHOST_SET_MEM_TABLE failed: {}",
-                        std::io::Error::last_os_error()
-                    );
-                    return;
-                }
-            }
-
-            // Set up vrings — only RX (0) and TX (1)
-            for (i, q) in queues.iter().enumerate().take(2) {
-                if !q.ready || q.size == 0 {
-                    continue;
-                }
-
-                let vring_num = VhostVringState {
-                    index: i as u32,
-                    num: q.size as u32,
-                };
-                libc::ioctl(vhost_fd, VHOST_SET_VRING_NUM, &vring_num);
-
-                let vring_addr = VhostVringAddr {
-                    index: i as u32,
-                    flags: 0,
-                    desc_user_addr: guest_to_host(mem, q.desc_addr),
-                    used_user_addr: guest_to_host(mem, q.used_addr),
-                    avail_user_addr: guest_to_host(mem, q.avail_addr),
-                    log_guest_addr: 0,
-                };
-                libc::ioctl(vhost_fd, VHOST_SET_VRING_ADDR, &vring_addr);
-
-                let vring_base = VhostVringState {
-                    index: i as u32,
-                    num: 0,
-                };
-                libc::ioctl(vhost_fd, VHOST_SET_VRING_BASE, &vring_base);
-
-                let kick_evt = EventFd::new(0).expect("eventfd");
-                let call_evt = EventFd::new(0).expect("eventfd");
-
-                let call_file = VhostVringFile {
-                    index: i as u32,
-                    fd: call_evt.as_raw_fd(),
-                };
-                libc::ioctl(vhost_fd, VHOST_SET_VRING_CALL, &call_file);
-
-                // KICK last — starts the vhost data plane
-                let kick_file = VhostVringFile {
-                    index: i as u32,
-                    fd: kick_evt.as_raw_fd(),
-                };
-                libc::ioctl(vhost_fd, VHOST_SET_VRING_KICK, &kick_file);
-
-                self.kick_evts.push(kick_evt);
-                self.call_evts.push(call_evt);
-            }
-
-            // CID AFTER queue setup
-            if libc::ioctl(vhost_fd, VHOST_VSOCK_SET_GUEST_CID, &self.guest_cid) < 0 {
-                eprintln!(
-                    "shuru: VHOST_VSOCK_SET_GUEST_CID failed: {}",
-                    std::io::Error::last_os_error()
-                );
-                return;
-            }
-
-            // START the vhost worker — without this, no queues are processed!
-            let running: libc::c_int = 1;
-            if libc::ioctl(vhost_fd, VHOST_VSOCK_SET_RUNNING, &running) < 0 {
-                eprintln!(
-                    "shuru: VHOST_VSOCK_SET_RUNNING failed: {}",
-                    std::io::Error::last_os_error()
-                );
-                return;
-            }
-            // Vhost worker is now running and processing queues.
-
-            // Can't use KVM_IRQFD because we need to set InterruptStatus
-            // BEFORE the interrupt reaches the guest.
-            self.irq_running.store(true, Ordering::Release);
-            let irq_running = self.irq_running.clone();
-            let vm_fd_clone = vm_fd.clone();
-            let call_fd_0 = self.call_evts.get(0).map(|e| e.as_raw_fd()).unwrap_or(-1);
-            let call_fd_1 = self.call_evts.get(1).map(|e| e.as_raw_fd()).unwrap_or(-1);
-            self.irq_thread = std::thread::Builder::new()
-                .name("vsock-irq".into())
-                .spawn(move || {
-                    let mut pfds = [
-                        libc::pollfd {
-                            fd: call_fd_0,
-                            events: libc::POLLIN,
-                            revents: 0,
-                        },
-                        libc::pollfd {
-                            fd: call_fd_1,
-                            events: libc::POLLIN,
-                            revents: 0,
-                        },
-                    ];
-                    while irq_running.load(Ordering::Acquire) {
-                        let ret = libc::poll(pfds.as_mut_ptr(), 2, 500);
-                        if ret > 0 {
-                            for pfd in &mut pfds {
-                                if pfd.revents & (libc::POLLIN | libc::POLLNVAL) == libc::POLLIN {
-                                    let mut val: u64 = 0;
-                                    libc::read(pfd.fd, &mut val as *mut _ as *mut libc::c_void, 8);
-                                    _interrupt_status.fetch_or(1, Ordering::Release);
-                                    let _ = vm_fd_clone.set_irq_line(irq, true);
-                                }
-                            }
-                        }
-                    }
-                })
-                .ok();
-        }
-    }
-
-    fn process_queue(
-        &mut self,
-        queue_idx: u16,
-        _queues: &mut [VirtioQueueState],
-        _mem: &GuestMemoryMmap,
-        _vm_fd: &Arc<VmFd>,
-        _irq: u32,
-    ) {
-        // Signal the kick eventfd so the vhost kernel module processes the queue.
-        if let Some(evt) = self.kick_evts.get(queue_idx as usize) {
-            let _ = evt.write(1);
-        }
-    }
-
-    fn reset(&mut self) {
-        self.irq_running.store(false, Ordering::Release);
-        if let Some(h) = self.irq_thread.take() {
-            let _ = h.join();
-        }
-        self.kick_evts.clear();
-        self.call_evts.clear();
-        if let Some(fd) = self.vhost_fd.take() {
-            unsafe {
-                libc::close(fd);
+            if rx_q.wants_interrupt(&mem) {
+                interrupt.raise(INTERRUPT_USED);
             }
         }
     }
 }
 
-impl Drop for VhostVsockBackend {
-    fn drop(&mut self) {
-        self.reset();
+#[cfg(test)]
+mod block_tests {
+    use super::*;
+    use std::os::unix::fs::FileExt;
+
+    fn backend() -> BlockBackend {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "shuru-block-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        std::fs::remove_file(path).unwrap();
+        file.set_len(16384).unwrap();
+        file.write_all_at(&vec![7; 16384], 0).unwrap();
+        let mut disk = BlockBackend::new(file, false).unwrap();
+        disk.features_ok(disk.device_features());
+        disk
+    }
+
+    fn request(mem: &GuestMemoryMmap, kind: u32, ranges: &[(u64, u32, u32)]) -> Vec<VringDesc> {
+        mem.write_obj(kind.to_le(), GuestAddress(0x1000)).unwrap();
+        mem.write_obj(0u64, GuestAddress(0x1008)).unwrap();
+        for (i, (sector, count, flags)) in ranges.iter().enumerate() {
+            let at = 0x2000 + i as u64 * 16;
+            mem.write_obj(sector.to_le(), GuestAddress(at)).unwrap();
+            mem.write_obj(count.to_le(), GuestAddress(at + 8)).unwrap();
+            mem.write_obj(flags.to_le(), GuestAddress(at + 12)).unwrap();
+        }
+        vec![
+            VringDesc {
+                addr: 0x1000,
+                len: 16,
+                flags: 1,
+                next: 1,
+            },
+            VringDesc {
+                addr: 0x2000,
+                len: ranges.len() as u32 * 16,
+                flags: 1,
+                next: 2,
+            },
+            VringDesc {
+                addr: 0x3000,
+                len: 1,
+                flags: 2,
+                next: 0,
+            },
+        ]
+    }
+
+    #[test]
+    fn invalid_later_range_leaves_disk_untouched() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 65536)]).unwrap();
+        let mut disk = backend();
+        let chain = request(&mem, VIRTIO_BLK_T_DISCARD, &[(0, 8, 0), (31, 2, 0)]);
+        assert_eq!(disk.request(&mem, &chain), Err(VIRTIO_BLK_S_IOERR));
+        let mut bytes = [0; 16384];
+        disk.disk.read_exact_at(&mut bytes, 0).unwrap();
+        assert!(bytes.iter().all(|b| *b == 7));
+    }
+
+    #[test]
+    fn discard_and_both_zero_modes_preserve_size_and_neighbors() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 65536)]).unwrap();
+        for (kind, flags) in [
+            (VIRTIO_BLK_T_DISCARD, 0),
+            (VIRTIO_BLK_T_WRITE_ZEROES, 0),
+            (VIRTIO_BLK_T_WRITE_ZEROES, 1),
+        ] {
+            let mut disk = backend();
+            let chain = request(&mem, kind, &[(8, 8, flags)]);
+            assert_eq!(disk.request(&mem, &chain), Ok(0));
+            let mut bytes = [0; 16384];
+            disk.disk.read_exact_at(&mut bytes, 0).unwrap();
+            assert!(bytes[..4096].iter().all(|b| *b == 7));
+            assert!(bytes[4096..8192].iter().all(|b| *b == 0));
+            assert!(bytes[8192..].iter().all(|b| *b == 7));
+            assert_eq!(disk.disk.metadata().unwrap().len(), 16384);
+        }
+    }
+
+    #[test]
+    fn descriptor_cycles_and_bad_heads_finish_without_io() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 65536)]).unwrap();
+        let mut disk = backend();
+        let mut q = VirtioQueueState::new(8);
+        q.size = 8;
+        q.ready = true;
+        q.desc_addr = 0x1000;
+        q.avail_addr = 0x2000;
+        q.used_addr = 0x3000;
+        mem.write_obj(1u16, GuestAddress(q.desc_addr + 12)).unwrap();
+        mem.write_obj(0u16, GuestAddress(q.desc_addr + 14)).unwrap();
+        mem.write_obj(2u16, GuestAddress(q.avail_addr + 2)).unwrap();
+        mem.write_obj(0u16, GuestAddress(q.avail_addr + 4)).unwrap();
+        mem.write_obj(100u16, GuestAddress(q.avail_addr + 6))
+            .unwrap();
+        assert!(disk.process_queue(0, std::slice::from_mut(&mut q), &mem));
+        assert_eq!(q.last_avail_idx, 2);
+        assert_eq!(
+            mem.read_obj::<u16>(GuestAddress(q.used_addr + 2)).unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn readonly_and_bad_data_direction_are_rejected() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 65536)]).unwrap();
+        let mut disk = backend();
+        let mut chain = request(&mem, VIRTIO_BLK_T_DISCARD, &[(0, 8, 0)]);
+        chain[1].flags |= VRING_DESC_F_WRITE;
+        assert_eq!(disk.request(&mem, &chain), Err(VIRTIO_BLK_S_IOERR));
+        chain[1].flags &= !VRING_DESC_F_WRITE;
+        disk.read_only = true;
+        assert_eq!(disk.request(&mem, &chain), Err(VIRTIO_BLK_S_IOERR));
+        assert_eq!(disk.device_features() & ((1 << 13) | (1 << 14)), 0);
+    }
+}
+
+#[cfg(test)]
+mod queue_tests {
+    use super::*;
+
+    const DESC: u64 = 0x1000;
+    const AVAIL: u64 = 0x2000;
+    const USED: u64 = 0x3000;
+
+    fn queue(size: u16) -> VirtioQueueState {
+        VirtioQueueState {
+            size,
+            ready: true,
+            desc_addr: DESC,
+            avail_addr: AVAIL,
+            used_addr: USED,
+            ..VirtioQueueState::new(256)
+        }
+    }
+
+    fn desc(mem: &GuestMemoryMmap, i: u16, addr: u64, len: u32, flags: u16, next: u16) {
+        let at = DESC + i as u64 * 16;
+        mem.write_obj(addr, GuestAddress(at)).unwrap();
+        mem.write_obj(len, GuestAddress(at + 8)).unwrap();
+        mem.write_obj(flags, GuestAddress(at + 12)).unwrap();
+        mem.write_obj(next, GuestAddress(at + 14)).unwrap();
+    }
+
+    fn offer(mem: &GuestMemoryMmap, heads: &[u16]) {
+        for (i, head) in heads.iter().enumerate() {
+            mem.write_obj(*head, GuestAddress(AVAIL + 4 + i as u64 * 2))
+                .unwrap();
+        }
+        mem.write_obj(heads.len() as u16, GuestAddress(AVAIL + 2))
+            .unwrap();
+    }
+
+    fn memory() -> GuestMemoryMmap {
+        GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap()
+    }
+
+    #[test]
+    fn pending_rejects_unusable_queues() {
+        let mem = memory();
+        offer(&mem, &[0]);
+        assert_eq!(queue(8).pending(&mem), Some(1));
+        assert_eq!(queue(0).pending(&mem), None);
+        assert_eq!(queue(257).pending(&mem), None);
+        let mut far = queue(8);
+        far.desc_addr = 0x1FFC0;
+        assert_eq!(far.pending(&mem), None);
+        mem.write_obj(9u16, GuestAddress(AVAIL + 2)).unwrap();
+        assert_eq!(queue(8).pending(&mem), None);
+    }
+
+    #[test]
+    fn chain_rejects_loops_out_of_range_and_foreign_flags() {
+        let mem = memory();
+        let q = queue(8);
+        desc(&mem, 0, 0x8000, 4, VRING_DESC_F_NEXT, 1);
+        desc(&mem, 1, 0x8000, 4, 0, 0);
+        assert_eq!(
+            q.chain(&mem, 0, VRING_DESC_F_NEXT).map(|c| c.len()),
+            Some(2)
+        );
+        desc(&mem, 1, 0x8000, 4, VRING_DESC_F_NEXT, 0);
+        assert!(q.chain(&mem, 0, VRING_DESC_F_NEXT).is_none());
+        desc(&mem, 1, 0x8000, 4, VRING_DESC_F_NEXT, 8);
+        assert!(q.chain(&mem, 0, VRING_DESC_F_NEXT).is_none());
+        desc(&mem, 1, 0x8000, 4, VRING_DESC_F_WRITE, 0);
+        assert!(q.chain(&mem, 0, VRING_DESC_F_NEXT).is_none());
+        assert!(q.chain(&mem, 8, VRING_DESC_F_NEXT).is_none());
+    }
+
+    #[test]
+    fn net_tx_drops_bad_chains_and_sends_good_frames() {
+        let mem = memory();
+        let (host, guest) = std::os::unix::net::UnixDatagram::pair().unwrap();
+        host.set_nonblocking(true).unwrap();
+        let mut net = NetBackend::new(guest.as_raw_fd(), [0; 6]);
+        let mut queues = [queue(8), queue(8)];
+
+        // A chain that points at itself, then one descriptor of 4 GiB.
+        desc(&mem, 0, 0x8000, 64, VRING_DESC_F_NEXT, 0);
+        desc(&mem, 1, 0x8000, u32::MAX, 0, 0);
+        // A frame split over two descriptors.
+        mem.write_slice(&[0xAB; 64], GuestAddress(0x9000)).unwrap();
+        desc(
+            &mem,
+            2,
+            0x9000,
+            VIRTIO_NET_HDR_SIZE as u32,
+            VRING_DESC_F_NEXT,
+            3,
+        );
+        desc(&mem, 3, 0x9000 + VIRTIO_NET_HDR_SIZE as u64, 20, 0, 0);
+        offer(&mem, &[0, 1, 2]);
+
+        assert!(net.process_queue(1, &mut queues, &mem));
+        assert_eq!(queues[1].last_avail_idx, 3);
+        let mut frame = [0u8; 128];
+        assert_eq!(host.recv(&mut frame).unwrap(), 20);
+        assert!(host.recv(&mut frame).is_err());
+        drop(guest);
     }
 }

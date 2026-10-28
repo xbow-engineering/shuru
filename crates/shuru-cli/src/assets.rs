@@ -14,7 +14,7 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub fn assets_ready(data_dir: &str) -> bool {
     let kernel = format!("{}/Image", data_dir);
     let rootfs = format!("{}/rootfs.ext4", data_dir);
-    let initramfs = format!("{}/initramfs.cpio.gz", data_dir);
+    let initramfs = format!("{}/initramfs.cpio", data_dir);
 
     if !Path::new(&kernel).exists()
         || !Path::new(&rootfs).exists()
@@ -52,7 +52,8 @@ fn download_os_image_version(data_dir: &str, version: &str) -> Result<()> {
     eprintln!("shuru: downloading OS image ({})...", tag);
     eprintln!("shuru: {}", url);
 
-    let response = ureq::get(&url)
+    let response = crate::http::agent()
+        .get(&url)
         .call()
         .with_context(|| format!("download failed — is version {} released?", tag))?;
 
@@ -71,6 +72,8 @@ fn download_os_image_version(data_dir: &str, version: &str) -> Result<()> {
         .context("failed to extract OS image")?;
 
     eprintln!(); // newline after progress
+
+    shuru_vm::WorkDisk::prepare_base(&format!("{}/rootfs.ext4", data_dir))?;
 
     // Write VERSION file
     let version_file = format!("{}/VERSION", data_dir);
@@ -102,6 +105,8 @@ pub fn upgrade(data_dir: &str) -> Result<()> {
             bail!("This copy was installed via Homebrew. Please run `brew upgrade shuru` instead");
         }
     }
+    // Working disks lived here before 0.9.2 and could outlive a crashed run.
+    let _ = std::fs::remove_dir_all(format!("{}/instances", data_dir));
 
     eprintln!("shuru: checking for updates...");
 
@@ -110,7 +115,8 @@ pub fn upgrade(data_dir: &str) -> Result<()> {
         GITHUB_REPO
     );
 
-    let response = ureq::get(&api_url)
+    let response = crate::http::agent()
+        .get(&api_url)
         .header("Accept", "application/vnd.github+json")
         .header("User-Agent", "shuru")
         .call()
@@ -145,7 +151,8 @@ pub fn upgrade(data_dir: &str) -> Result<()> {
     eprintln!("shuru: downloading CLI ({})...", latest);
     eprintln!("shuru: {}", cli_url);
 
-    let response = ureq::get(&cli_url)
+    let response = crate::http::agent()
+        .get(&cli_url)
         .call()
         .with_context(|| format!("failed to download CLI v{}", latest))?;
 

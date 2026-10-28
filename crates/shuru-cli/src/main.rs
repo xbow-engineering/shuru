@@ -2,6 +2,8 @@ mod assets;
 mod checkpoint;
 mod cli;
 mod config;
+mod http;
+mod recipe;
 mod stdio;
 mod vm;
 
@@ -12,7 +14,7 @@ use clap::Parser;
 
 use shuru_vm::{default_data_dir, VmState};
 
-use cli::{CheckpointCommands, Cli, Commands};
+use cli::{CheckpointCommands, Cli, Commands, RecipeCommands};
 use config::load_config;
 
 fn main() -> Result<()> {
@@ -29,11 +31,25 @@ fn main() -> Result<()> {
         Commands::Run {
             vm,
             from,
+            recipe,
+            yes,
+            checkpoint,
             console,
             stdio,
             command,
         } => {
             let cfg = load_config(vm.config.as_deref())?;
+
+            // A recipe is built (once) before the run, with its own policy.
+            let from = match recipe {
+                Some(ref reference) => Some(recipe::ensure_checkpoint(
+                    reference,
+                    &vm,
+                    yes,
+                    checkpoint.as_deref(),
+                )?),
+                None => from,
+            };
 
             // Command resolution: CLI args > config > default /bin/sh
             let command = if !command.is_empty() {
@@ -51,10 +67,9 @@ fn main() -> Result<()> {
             } else if console {
                 run_console(&prepared)
             } else {
-                vm::run_command(&prepared, &command).map(|r| r.exit_code)
+                vm::run_command(&prepared, &command, None).map(|r| r.exit_code)
             };
 
-            let _ = std::fs::remove_dir_all(&prepared.instance_dir);
             process::exit(result?);
         }
         Commands::Init { force } => {
@@ -75,47 +90,41 @@ fn main() -> Result<()> {
             let data_dir = default_data_dir();
             assets::upgrade(&data_dir)?;
         }
-        Commands::Prune => {
-            let data_dir = default_data_dir();
-            let instances_dir = format!("{}/instances", data_dir);
-            let entries = match std::fs::read_dir(&instances_dir) {
-                Ok(entries) => entries,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    eprintln!("shuru: no orphaned instances found");
-                    return Ok(());
-                }
-                Err(e) => return Err(e.into()),
-            };
-
-            let mut removed = 0u32;
-            for entry in entries {
-                let entry = entry?;
-                let name = entry.file_name();
-                let Some(pid) = name.to_str().and_then(|s| s.parse::<i32>().ok()) else {
-                    continue;
-                };
-                // Check if the process is still running
-                let alive = unsafe { libc::kill(pid, 0) } == 0;
-                if !alive {
-                    std::fs::remove_dir_all(entry.path())?;
-                    removed += 1;
-                }
-            }
-
-            if removed == 0 {
-                eprintln!("shuru: no orphaned instances found");
-            } else {
-                eprintln!("shuru: removed {} orphaned instance(s)", removed);
-            }
-        }
         Commands::Checkpoint { action } => match action {
             CheckpointCommands::Create {
                 name,
                 vm,
                 from,
+                recipe,
+                yes,
                 command,
             } => {
+                if let Some(ref reference) = recipe {
+                    if !command.is_empty() {
+                        anyhow::bail!("--recipe builds from the recipe steps; drop the command");
+                    }
+                    recipe::create_checkpoint(&name, reference, &vm, yes)?;
+                    return Ok(());
+                }
                 let exit_code = checkpoint::create(name, &vm, from.as_deref(), command)?;
+                process::exit(exit_code);
+            }
+            CheckpointCommands::Update {
+                name,
+                vm,
+                from,
+                recipe,
+                yes,
+                command,
+            } => {
+                if let Some(ref reference) = recipe {
+                    if !command.is_empty() {
+                        anyhow::bail!("--recipe builds from the recipe steps; drop the command");
+                    }
+                    recipe::update_checkpoint(&name, reference, &vm, yes)?;
+                    return Ok(());
+                }
+                let exit_code = checkpoint::update(name, &vm, from.as_deref(), command)?;
                 process::exit(exit_code);
             }
             CheckpointCommands::List => checkpoint::list()?,
@@ -127,6 +136,10 @@ fn main() -> Result<()> {
                 anyhow::bail!("checkpoint pull is not yet implemented")
             }
         },
+        Commands::Recipe { action } => match action {
+            RecipeCommands::List { refresh } => recipe::list(refresh)?,
+            RecipeCommands::Show { recipe: reference } => recipe::show(&reference)?,
+        },
     }
 
     Ok(())
@@ -135,7 +148,11 @@ fn main() -> Result<()> {
 /// Run the VM in raw serial console mode (for debugging).
 fn run_console(prepared: &vm::PreparedVm) -> Result<i32> {
     eprintln!("shuru: kernel={}", prepared.kernel_path);
-    eprintln!("shuru: rootfs={} (work copy)", prepared.work_rootfs);
+    eprintln!(
+        "shuru: rootfs={} (anonymous clone of {})",
+        prepared.work_disk.attach_path(),
+        prepared.source_rootfs
+    );
     eprintln!(
         "shuru: booting VM ({}cpus, {}MB RAM, {}MB disk)...",
         prepared.cpus, prepared.memory, prepared.disk_size

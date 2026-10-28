@@ -23,11 +23,49 @@ use shuru_linux::terminal;
 #[cfg(target_os = "linux")]
 use shuru_linux::*;
 
+/// Most bytes a buffered call (`read_file`, `exec_buffered`) holds on the
+/// host, so a guest cannot grow host memory by producing more.
+pub const MAX_BUFFERED: usize = 64 * 1024 * 1024;
+
+fn too_large() -> String {
+    format!(
+        "{} MiB, the limit for buffered calls; stream it instead",
+        MAX_BUFFERED >> 20
+    )
+}
+
+pub struct ExecOutput {
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub exit_code: i32,
+}
+
+#[derive(Default)]
+struct Capped(Vec<u8>);
+
+impl Write for Capped {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.0.len() + buf.len() > MAX_BUFFERED {
+            return Err(std::io::Error::other(format!(
+                "output is larger than {}",
+                too_large()
+            )));
+        }
+        self.0.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 use shuru_proto::{
     frame, ChmodRequest, CopyRequest, DiscardRequest, ExecRequest, ForwardRequest, ForwardResponse,
     FsOkResponse, MkdirRequest, MountRequest, MountResponse, PortMapping, ReadDirRequest,
-    ReadDirResponse, ReadFileRequest, RemoveRequest, RenameRequest, StatRequest, StatResponse,
-    WatchRequest, WriteFileRequest, WriteFileResponse, VSOCK_PORT, VSOCK_PORT_FORWARD,
+    ReadDirResponse, ReadFileRequest, RemoveRequest, RenameRequest, ShutdownResponse, StatRequest,
+    StatResponse, WatchRequest, WriteFileRequest, WriteFileResponse, VSOCK_PORT,
+    VSOCK_PORT_FORWARD,
 };
 
 // --- Mount types ---
@@ -137,32 +175,48 @@ impl VmConfigBuilder {
         }
 
         let boot_loader = LinuxBootLoader::new_with_kernel(&kernel_path);
-        if let Some(ref initrd) = self.initrd {
-            boot_loader.set_initrd(initrd);
-        }
+        boot_loader.set_initrd(
+            self.initrd
+                .as_ref()
+                .context("image initramfs is required")?,
+        );
 
-        let cmdline = if self.verbose {
-            "console=hvc0 root=/dev/vda rw init=/usr/bin/shuru-init"
-        } else {
-            "console=hvc0 root=/dev/vda rw init=/usr/bin/shuru-init quiet"
+        let mut identity = shuru_proto::hello::Identity {
+            token: [0; 32],
+            instance: [0; 16],
         };
-        boot_loader.set_command_line(cmdline);
+        getrandom::fill(&mut identity.token)
+            .map_err(|_| anyhow::anyhow!("failed to generate guest token"))?;
+        getrandom::fill(&mut identity.instance)
+            .map_err(|_| anyhow::anyhow!("failed to generate guest instance"))?;
+        let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let token = hex(&identity.token);
+        let cmdline = if self.verbose {
+            "console=hvc0 root=/dev/vda rw"
+        } else {
+            "console=hvc0 root=/dev/vda rw quiet"
+        };
+        boot_loader.set_command_line(&format!(
+            "{cmdline} shuru.token={token} shuru.instance={}",
+            hex(&identity.instance)
+        ));
 
         let memory_bytes = self.memory_mb * 1024 * 1024;
         let config = VirtualMachineConfiguration::new(&boot_loader, self.cpus, memory_bytes);
 
-        let dev_null; // keep the File alive so the fd stays valid
-        let serial_attachment = if self.console {
-            FileHandleSerialAttachment::new(
-                std::io::stdin().as_raw_fd(),
-                std::io::stdout().as_raw_fd(),
-            )
-        } else if self.verbose {
-            FileHandleSerialAttachment::new_write_only(std::io::stderr().as_raw_fd())
+        let serial_output: std::os::fd::OwnedFd = if self.console || self.verbose {
+            crate::serial::output(token, self.console)?.into()
         } else {
-            dev_null = std::fs::File::open("/dev/null")
-                .map_err(|e| anyhow::anyhow!("failed to open /dev/null: {}", e))?;
-            FileHandleSerialAttachment::new_write_only(dev_null.as_raw_fd())
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/null")?
+                .into()
+        };
+        let output_fd = serial_output.as_raw_fd();
+        let serial_attachment = if self.console {
+            FileHandleSerialAttachment::new(std::io::stdin().as_raw_fd(), output_fd)
+        } else {
+            FileHandleSerialAttachment::new_write_only(output_fd)
         };
         let serial = VirtioConsoleSerialPort::new_with_attachment(&serial_attachment);
         config.set_serial_ports(&[serial]);
@@ -186,7 +240,13 @@ impl VmConfigBuilder {
         config.set_storage_devices(&[&block_device]);
 
         if let Some(fd) = self.network_fd {
-            let net_attachment = FileHandleNetworkAttachment::new(fd);
+            // IP-MTU 65535: hands smoltcp/host one ~64 KiB super-frame per
+            // syscall instead of segmenting at 1500 B. Must match
+            // `shuru_proxy::device::MTU` (Ethernet frame size = 14 + this).
+            // The associated socket buffers are sized in
+            // `shuru_proxy::create_socketpair`.
+            const NET_IP_MTU: i64 = 65535;
+            let net_attachment = FileHandleNetworkAttachment::new(fd, NET_IP_MTU);
             let net_device = VirtioNetworkDevice::new_with_attachment(&net_attachment);
             net_device.set_mac_address(&MACAddress::random_local());
             config.set_network_devices(&[net_device]);
@@ -215,23 +275,40 @@ impl VmConfigBuilder {
         config.set_socket_devices(&[socket_device]);
 
         config.set_entropy_devices(&[VirtioEntropyDevice::new()]);
+        config.set_memory_balloon_devices(&[VirtioMemoryBalloonDevice::new()]);
 
         config
             .validate()
             .map_err(|e| anyhow::anyhow!("VM configuration invalid: {}", e))?;
 
+        #[cfg(target_os = "linux")]
+        let machine = VirtualMachine::new(&config)?;
+        #[cfg(target_os = "macos")]
+        let machine = VirtualMachine::new(&config);
         Ok(Sandbox {
-            vm: Arc::new(VirtualMachine::new(&config)),
+            vm: Arc::new(GuestVm {
+                machine,
+                identity,
+                _serial_output: serial_output,
+            }),
             mounts: Mutex::new(mount_requests),
+            disk_operation: Mutex::new(()),
         })
     }
 }
 
 // --- Sandbox ---
 
+#[derive(Clone, Copy, PartialEq)]
+pub enum AfterSave {
+    Thaw,
+    PowerOff,
+}
+
 pub struct Sandbox {
-    vm: Arc<VirtualMachine>,
+    vm: Arc<GuestVm>,
     mounts: Mutex<Vec<MountRequest>>,
+    disk_operation: Mutex<()>,
 }
 
 impl Sandbox {
@@ -245,10 +322,138 @@ impl Sandbox {
             .map_err(|e| anyhow::anyhow!("Failed to start VM: {}", e))
     }
 
+    fn disk_request<T: serde::de::DeserializeOwned>(&self, kind: u8, payload: &[u8]) -> Result<T> {
+        let mut stream = self.connect_vsock()?;
+        stream.set_read_timeout(Some(SHUTDOWN_TIMEOUT))?;
+        stream.set_write_timeout(Some(SHUTDOWN_TIMEOUT))?;
+        frame::write_frame(&mut stream, kind, payload)?;
+        match frame::read_frame(&mut stream)? {
+            Some((k, data)) if k == kind + 1 => Ok(serde_json::from_slice(&data)?),
+            Some((frame::ERROR, data)) => bail!(
+                "guest disk operation failed: {}",
+                String::from_utf8_lossy(&data)
+            ),
+            _ => bail!("guest did not acknowledge disk operation"),
+        }
+    }
+
+    pub fn trim(&self) -> Result<shuru_proto::TrimResponse> {
+        let _guard = self.disk_operation.lock().unwrap();
+        self.disk_request(frame::TRIM_REQ, &[])
+    }
+
+    /// Save a sealed disk through a file clone or a CAS index writer.
+    /// The writer must create the supplied path and finish before returning.
+    /// Returns the services the guest stopped, which only a PowerOff save
+    /// asks for.
+    pub fn save_disk(
+        &self,
+        dest: &str,
+        after: AfterSave,
+        copy: impl FnOnce(&str) -> Result<()>,
+    ) -> Result<ShutdownResponse> {
+        let _guard = self.disk_operation.lock().unwrap();
+        crate::checkpoint::check_format(dest)?;
+        let mut bytes = [0; 8];
+        getrandom::fill(&mut bytes).map_err(|_| anyhow::anyhow!("generate seal id"))?;
+        let id = u64::from_ne_bytes(bytes);
+        let req = shuru_proto::SealRequest {
+            id,
+            stop_services: after == AfterSave::PowerOff,
+            lease_ms: 300_000,
+        };
+        let sealed = self
+            .disk_request(frame::SEAL_REQ, &serde_json::to_vec(&req)?)
+            .and_then(|response| match response {
+                shuru_proto::SealResponse::Sealed(services) => Ok(services),
+                _ => Err(anyhow::anyhow!("guest did not seal root")),
+            });
+        let services = match sealed {
+            Ok(services) => services,
+            Err(e) => {
+                if after == AfterSave::PowerOff {
+                    let _ = self.kill();
+                }
+                return Err(e);
+            }
+        };
+        let thaw = || -> Result<()> {
+            let resp: shuru_proto::SealResponse = self.disk_request(
+                frame::THAW_REQ,
+                &serde_json::to_vec(&shuru_proto::ThawRequest { id })?,
+            )?;
+            if resp != shuru_proto::SealResponse::Thawed {
+                bail!("seal expired before checkpoint copy completed");
+            }
+            Ok(())
+        };
+        let result = crate::checkpoint::publish(dest, copy, || {
+            thaw()?;
+            if after == AfterSave::PowerOff {
+                self.kill()?;
+            }
+            Ok(())
+        });
+        if result.is_err() {
+            let _ = thaw();
+            if after == AfterSave::PowerOff {
+                let _ = self.kill();
+            }
+        }
+        result.map(|()| services)
+    }
+
+    /// Ask the guest to stop its services and sync the disk (RFC 0004).
+    /// Returns what the guest stopped, or an error if it did not answer
+    /// within the shutdown timeout.
+    pub fn shutdown(&self) -> Result<ShutdownResponse> {
+        let stream = self.connect_vsock()?;
+        let _ = stream.set_read_timeout(Some(SHUTDOWN_TIMEOUT));
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(shutdown_handshake(stream));
+        });
+        match rx.recv_timeout(SHUTDOWN_TIMEOUT + Duration::from_secs(5)) {
+            Ok(result) => result,
+            Err(_) => bail!(
+                "guest did not answer the shutdown request within {}s",
+                SHUTDOWN_TIMEOUT.as_secs()
+            ),
+        }
+    }
+
+    /// Graceful stop: shutdown handshake, then power off. Falls back to a
+    /// plain power off when the guest does not answer.
     pub fn stop(&self) -> Result<()> {
+        // Only a running guest can answer; a VM that already died would
+        // just make the vsock connect retry until it gives up.
+        if matches!(self.vm.state(), VmState::Running) {
+            if let Err(e) = self.shutdown() {
+                tracing::warn!("guest shutdown failed, powering off: {}", e);
+            }
+        }
+        self.kill()
+    }
+
+    /// Power off without asking the guest. Services get no SIGTERM and the
+    /// disk is not synced.
+    pub fn kill(&self) -> Result<()> {
+        if matches!(self.vm.state(), VmState::Stopped) {
+            return Ok(());
+        }
         self.vm
             .stop()
             .map_err(|e| anyhow::anyhow!("Failed to stop VM: {}", e))
+    }
+
+    /// How much memory the guest keeps, in bytes. The guest hands the rest
+    /// back to the host through the balloon device and gets it back when
+    /// the target rises again. On a Linux host the guest also reports free
+    /// pages on its own, so idle memory returns without a target.
+    pub fn set_memory_target(&self, bytes: u64) -> Result<()> {
+        self.vm
+            .set_memory_target(bytes)
+            .map_err(|e| anyhow::anyhow!("Failed to set memory target: {}", e))
     }
 
     /// Block until the guest control server accepts vsock connections.
@@ -292,6 +497,23 @@ impl Sandbox {
         Ok(())
     }
 
+    /// Run a command and hold its output in memory, up to MAX_BUFFERED per
+    /// stream. Output past that fails the call; stream it with `open_exec`.
+    pub fn exec_buffered(
+        &self,
+        argv: &[impl AsRef<str>],
+        env: &HashMap<String, String>,
+    ) -> Result<ExecOutput> {
+        let mut stdout = Capped::default();
+        let mut stderr = Capped::default();
+        let exit_code = self.exec_with_env(argv, env, &mut stdout, &mut stderr)?;
+        Ok(ExecOutput {
+            stdout: stdout.0,
+            stderr: stderr.0,
+            exit_code,
+        })
+    }
+
     /// Run a command non-interactively over vsock, streaming output to the
     /// provided writers. Returns the guest process exit code.
     pub fn exec(
@@ -323,6 +545,7 @@ impl Sandbox {
             rows: None,
             cols: None,
             cwd: None,
+            id: None,
         };
         frame::send_json(&mut writer, frame::EXEC_REQ, &req)?;
 
@@ -366,18 +589,27 @@ impl Sandbox {
         };
         frame::send_json(&mut writer, frame::READ_FILE_REQ, &req)?;
 
-        match frame::read_frame(&mut reader).context("reading read_file response")? {
-            Some((frame::READ_FILE_RESP, payload)) => Ok(payload),
-            Some((frame::ERROR, payload)) => {
-                bail!("{}", String::from_utf8_lossy(&payload));
+        let mut data = Vec::new();
+        loop {
+            match frame::read_frame(&mut reader).context("reading read_file response")? {
+                Some((frame::READ_FILE_RESP, chunk)) if chunk.is_empty() => return Ok(data),
+                Some((frame::READ_FILE_RESP, chunk)) => {
+                    if data.len() + chunk.len() > MAX_BUFFERED {
+                        bail!("{path} is larger than {}", too_large());
+                    }
+                    data.extend_from_slice(&chunk);
+                }
+                Some((frame::ERROR, payload)) => {
+                    bail!("{}", String::from_utf8_lossy(&payload));
+                }
+                Some((other, _)) => {
+                    bail!(
+                        "unexpected frame type 0x{:02x} in read_file response",
+                        other
+                    );
+                }
+                None => bail!("guest closed connection during read_file"),
             }
-            Some((other, _)) => {
-                bail!(
-                    "unexpected frame type 0x{:02x} in read_file response",
-                    other
-                );
-            }
-            None => bail!("guest closed connection during read_file"),
         }
     }
 
@@ -393,7 +625,9 @@ impl Sandbox {
             len: content.len() as u64,
         };
         frame::send_json(&mut writer, frame::WRITE_FILE_REQ, &req)?;
-        frame::write_frame(&mut writer, frame::WRITE_FILE_DATA, content)?;
+        for chunk in content.chunks(frame::FILE_CHUNK) {
+            frame::write_frame(&mut writer, frame::WRITE_FILE_DATA, chunk)?;
+        }
 
         let (_msg_type, payload) = frame::read_frame(&mut reader)
             .context("reading write_file response")?
@@ -609,18 +843,22 @@ impl Sandbox {
     /// Open a vsock connection for streaming exec. Returns the raw stream
     /// after sending mounts + ExecRequest. Caller manages I/O (reads
     /// STDOUT/STDERR/EXIT frames, writes STDIN/KILL frames).
+    /// Returns the stream and an id that `kill_exec` takes.
     pub fn open_exec(
         &self,
         argv: &[impl AsRef<str>],
         env: &HashMap<String, String>,
         cwd: Option<&str>,
-    ) -> Result<TcpStream> {
+    ) -> Result<(TcpStream, u64)> {
         let stream = self.connect_vsock()?;
         let mut writer = stream.try_clone()?;
         let mut reader = stream.try_clone()?;
 
         self.send_mount_requests(&mut writer, &mut reader)?;
 
+        let mut bytes = [0; 8];
+        getrandom::fill(&mut bytes).map_err(|_| anyhow::anyhow!("generate exec id"))?;
+        let id = u64::from_ne_bytes(bytes);
         let req = ExecRequest {
             argv: argv.iter().map(|s| s.as_ref().to_string()).collect(),
             env: env.clone(),
@@ -628,10 +866,28 @@ impl Sandbox {
             rows: None,
             cols: None,
             cwd: cwd.map(|s| s.to_string()),
+            id: Some(id),
         };
         frame::send_json(&mut writer, frame::EXEC_REQ, &req)?;
 
-        Ok(stream)
+        Ok((stream, id))
+    }
+
+    /// SIGKILL the process group of an exec from `open_exec`. Works when its
+    /// own connection is stalled, for example behind stdin it never reads.
+    pub fn kill_exec(&self, id: u64) -> Result<()> {
+        let mut stream = self.connect_vsock()?;
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+        frame::send_json(
+            &mut stream,
+            frame::KILL_REQ,
+            &shuru_proto::KillRequest { id },
+        )?;
+        match frame::read_frame(&mut stream)? {
+            Some((frame::KILL_RESP, _)) => Ok(()),
+            _ => bail!("guest did not acknowledge kill"),
+        }
     }
 
     /// Open a vsock connection for an interactive shell with PTY support.
@@ -669,6 +925,7 @@ impl Sandbox {
             rows: Some(rows),
             cols: Some(cols),
             cwd: cwd.map(|s| s.to_string()),
+            id: None,
         };
         frame::send_json(&mut writer, frame::EXEC_REQ, &req)?;
 
@@ -716,6 +973,7 @@ impl Sandbox {
             rows: Some(rows),
             cols: Some(cols),
             cwd: None,
+            id: None,
         };
         frame::send_json(&mut writer, frame::EXEC_REQ, &req)?;
 
@@ -890,8 +1148,31 @@ impl Sandbox {
     }
 
     fn connect_vsock(&self) -> Result<TcpStream> {
-        let state_rx = self.vm.state_channel();
-        for attempt in 1..=1000 {
+        self.vm.connect_to_vsock_port(VSOCK_PORT)
+    }
+}
+
+struct GuestVm {
+    machine: VirtualMachine,
+    identity: shuru_proto::hello::Identity,
+    _serial_output: std::os::fd::OwnedFd,
+}
+
+impl std::ops::Deref for GuestVm {
+    type Target = VirtualMachine;
+    fn deref(&self) -> &Self::Target {
+        &self.machine
+    }
+}
+
+impl GuestVm {
+    fn connect_to_vsock_port(&self, port: u32) -> Result<TcpStream> {
+        let state_rx = self.machine.state_channel();
+        let attempts = if port == VSOCK_PORT { 1000 } else { 1 };
+        for attempt in 1..=attempts {
+            if matches!(self.machine.state(), VmState::Stopped | VmState::Error) {
+                bail!("VM stopped before guest connection");
+            }
             // Check if VM died (e.g. guest mount failure -> reboot POWER_OFF)
             if let Ok(state) = state_rx.try_recv() {
                 match state {
@@ -902,13 +1183,22 @@ impl Sandbox {
                     _ => {}
                 }
             }
-            match self.vm.connect_to_vsock_port(VSOCK_PORT) {
-                Ok(s) => {
+            match self.machine.connect_to_vsock_port(port) {
+                Ok(mut s) => {
                     let _ = s.set_nodelay(true);
+                    let timeout = Some(Duration::from_secs(2));
+                    s.set_read_timeout(timeout)?;
+                    s.set_write_timeout(timeout)?;
+                    self.identity.connect(&mut s).context(
+                        "the guest did not answer the connection hello; \
+                         its image is likely older than this shuru, run `shuru upgrade`",
+                    )?;
+                    s.set_read_timeout(None)?;
+                    s.set_write_timeout(None)?;
                     return Ok(s);
                 }
                 Err(e) => {
-                    if attempt == 1000 {
+                    if attempt == attempts {
                         bail!(
                             "Failed to connect to guest after {} attempts: {}",
                             attempt,
@@ -921,6 +1211,31 @@ impl Sandbox {
             }
         }
         unreachable!()
+    }
+}
+
+/// Upper bound on a graceful shutdown. Covers the slowest service stop
+/// timeout an image can reasonably declare, plus the sync.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(90);
+
+fn shutdown_handshake(stream: TcpStream) -> Result<ShutdownResponse> {
+    let mut writer = stream.try_clone()?;
+    let mut reader = stream;
+    frame::write_frame(&mut writer, frame::SHUTDOWN_REQ, &[])?;
+    loop {
+        match frame::read_frame(&mut reader).context("waiting for guest shutdown")? {
+            Some((frame::SHUTDOWN_RESP, payload)) => {
+                return serde_json::from_slice(&payload).context("parsing shutdown response");
+            }
+            Some((frame::ERROR, payload)) => {
+                bail!(
+                    "guest refused shutdown: {}",
+                    String::from_utf8_lossy(&payload)
+                )
+            }
+            Some(_) => {}
+            None => bail!("guest closed the connection before answering shutdown"),
+        }
     }
 }
 
@@ -942,11 +1257,7 @@ impl Drop for PortForwardHandle {
     }
 }
 
-fn handle_forward_connection(
-    tcp_stream: TcpStream,
-    vm: &VirtualMachine,
-    guest_port: u16,
-) -> Result<()> {
+fn handle_forward_connection(tcp_stream: TcpStream, vm: &GuestVm, guest_port: u16) -> Result<()> {
     let vsock_stream = open_forward_stream(vm, guest_port)?;
     // Bidirectional relay between TCP and vsock
     relay(tcp_stream, vsock_stream);
@@ -956,7 +1267,7 @@ fn handle_forward_connection(
 /// Open a vsock forward channel to a TCP port inside the guest and complete
 /// the forward handshake, returning the connected stream. The stream is a raw
 /// bidirectional pipe to `127.0.0.1:guest_port` inside the guest.
-fn open_forward_stream(vm: &VirtualMachine, guest_port: u16) -> Result<TcpStream> {
+fn open_forward_stream(vm: &GuestVm, guest_port: u16) -> Result<TcpStream> {
     let mut vsock_stream = vm
         .connect_to_vsock_port(VSOCK_PORT_FORWARD)
         .map_err(|e| anyhow::anyhow!("vsock connect for port forward: {}", e))?;
@@ -1000,3 +1311,7 @@ fn relay(a: TcpStream, b: TcpStream) {
     let _ = t1.join();
     let _ = t2.join();
 }
+
+#[cfg(test)]
+#[path = "disk_tests.rs"]
+mod disk_tests;

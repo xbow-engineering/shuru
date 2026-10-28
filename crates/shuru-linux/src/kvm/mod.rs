@@ -1,6 +1,8 @@
+pub mod balloon;
 pub mod devices;
 pub mod layout;
 pub mod virtio_fs;
+pub mod vsock;
 
 use std::fs::File;
 use std::io::Read;
@@ -28,39 +30,53 @@ use kvm_bindings::{KVM_DEV_ARM_VGIC_GRP_ADDR, KVM_DEV_ARM_VGIC_GRP_CTRL};
 pub struct KvmVm {
     #[allow(dead_code)]
     pub kvm: Kvm,
+    #[allow(dead_code)]
     pub vm_fd: Arc<VmFd>,
+    #[allow(dead_code)]
     pub mem: GuestMemoryMmap,
-    pub bus: Arc<Mutex<MmioBus>>,
+    pub bus: Arc<MmioBus>,
     pub vcpus: Vec<VcpuFd>,
     pub vcpu_threads: Vec<std::thread::JoinHandle<()>>,
     pub running: Arc<AtomicBool>,
-    pub guest_cid: u64,
+    pub vsock: Option<Arc<vsock::VsockControl>>,
+    pub balloon: Option<Arc<balloon::BalloonControl>>,
     #[allow(dead_code)]
     _gic: DeviceFd,
 }
 
 pub struct VmCreateConfig {
+    /// An open /dev/kvm; opened here when absent.
+    pub kvm: Option<std::os::fd::OwnedFd>,
     pub cpu_count: usize,
     pub memory_bytes: u64,
-    pub kernel_path: String,
-    pub initrd_path: Option<String>,
+    pub kernel: File,
+    pub initrd: Option<File>,
     pub command_line: String,
     pub serial_write_fd: Option<i32>,
     pub serial_read_fd: Option<i32>,
-    pub disk_path: Option<String>,
+    pub disk: Option<File>,
     pub disk_read_only: bool,
     pub network_fd: Option<i32>,
     pub network_mac: Option<[u8; 6]>,
     pub has_vsock: bool,
-    pub guest_cid: u64,
+    pub vsock_connections: usize,
     /// Virtio-fs mounts: (tag, host_path, read_only).
     pub mounts: Vec<(String, String, bool)>,
+    pub has_balloon: bool,
 }
 
 impl KvmVm {
-    pub fn create(config: VmCreateConfig) -> Result<Self, VzError> {
-        let kvm =
-            Kvm::new().map_err(|e| VzError::new(format!("failed to open /dev/kvm: {}", e)))?;
+    pub fn create(mut config: VmCreateConfig) -> Result<Self, VzError> {
+        let kvm = match config.kvm.take() {
+            // SAFETY: the descriptor is an open /dev/kvm handed over to us.
+            Some(fd) => unsafe {
+                use std::os::fd::{FromRawFd, IntoRawFd};
+                Kvm::from_raw_fd(fd.into_raw_fd())
+            },
+            None => {
+                Kvm::new().map_err(|e| VzError::new(format!("failed to open /dev/kvm: {}", e)))?
+            }
+        };
         let vm_fd = kvm
             .create_vm()
             .map_err(|e| VzError::new(format!("failed to create VM: {}", e)))?;
@@ -91,21 +107,24 @@ impl KvmVm {
         }
 
         // Load kernel (PE format for aarch64)
-        let mut kernel_file = File::open(&config.kernel_path)
-            .map_err(|e| VzError::new(format!("failed to open kernel: {}", e)))?;
         // kernel_offset must be 2MB-aligned. The PE loader adds text_offset
         // from the image header internally, so pass DRAM_BASE (1 GiB aligned).
-        let kernel_result = PE::load(&mem, Some(GuestAddress(DRAM_BASE)), &mut kernel_file, None)
-            .map_err(|e| VzError::new(format!("failed to load kernel: {}", e)))?;
+        let kernel_result = PE::load(
+            &mem,
+            Some(GuestAddress(DRAM_BASE)),
+            &mut config.kernel,
+            None,
+        )
+        .map_err(|e| VzError::new(format!("failed to load kernel: {}", e)))?;
         let entry_addr = kernel_result.kernel_load.raw_value();
 
         // Load initrd
         let mut initrd_addr: Option<u64> = None;
         let mut initrd_size: u64 = 0;
-        if let Some(ref initrd_path) = config.initrd_path {
+        if let Some(mut initrd) = config.initrd.take() {
             let mut initrd_data = Vec::new();
-            File::open(initrd_path)
-                .and_then(|mut f| f.read_to_end(&mut initrd_data))
+            initrd
+                .read_to_end(&mut initrd_data)
                 .map_err(|e| VzError::new(format!("failed to read initrd: {}", e)))?;
 
             // Place after FDT reservation, page-aligned
@@ -126,48 +145,29 @@ impl KvmVm {
         bus.add(
             UART_BASE,
             UART_SIZE,
-            Box::new(Pl011::new(config.serial_write_fd, config.serial_read_fd)),
+            Box::new(Mutex::new(Pl011::new(
+                config.serial_write_fd,
+                config.serial_read_fd,
+            ))),
         );
 
         // PL031 RTC - needed so the guest boots with the host wall clock
         // (otherwise TLS certs are "not yet valid" since 1970-01-01).
-        bus.add(RTC_BASE, RTC_SIZE, Box::new(Pl031::new()));
+        bus.add(RTC_BASE, RTC_SIZE, Box::new(Mutex::new(Pl031::new())));
 
         // Virtio block
-        if let Some(ref disk_path) = config.disk_path {
-            let blk = BlockBackend::new(disk_path, config.disk_read_only)
+        if let Some(disk) = config.disk.take() {
+            let blk = BlockBackend::new(disk, config.disk_read_only)
                 .map_err(|e| VzError::new(format!("failed to open disk: {}", e)))?;
-            let spi = VIRTIO_SPI_BASE + virtio_idx;
-            let base = VIRTIO_MMIO_BASE + (virtio_idx as u64) * VIRTIO_MMIO_GAP;
-            bus.add(
-                base,
-                VIRTIO_MMIO_SIZE,
-                Box::new(VirtioMmioDevice::new(
-                    Box::new(blk),
-                    spi,
-                    vm_fd.clone(),
-                    mem.clone(),
-                )),
-            );
-            virtio_idx += 1;
+            add_virtio(&mut bus, &mut virtio_idx, Box::new(blk), &vm_fd, &mem)?;
         }
 
-        // Vhost-vsock
-        let guest_cid = config.guest_cid;
+        let mut vsock_control = None;
         if config.has_vsock {
-            let spi = VIRTIO_SPI_BASE + virtio_idx;
-            let base = VIRTIO_MMIO_BASE + (virtio_idx as u64) * VIRTIO_MMIO_GAP;
-            bus.add(
-                base,
-                VIRTIO_MMIO_SIZE,
-                Box::new(VirtioMmioDevice::new(
-                    Box::new(VhostVsockBackend::new(guest_cid)),
-                    spi,
-                    vm_fd.clone(),
-                    mem.clone(),
-                )),
-            );
-            virtio_idx += 1;
+            let backend = vsock::VsockBackend::new(config.vsock_connections)
+                .map_err(|e| VzError::new(format!("failed to create vsock device: {e}")))?;
+            vsock_control = Some(backend.control());
+            add_virtio(&mut bus, &mut virtio_idx, Box::new(backend), &vm_fd, &mem)?;
         }
 
         // Virtio-fs mounts (one device per mount)
@@ -178,19 +178,7 @@ impl KvmVm {
                     tag, e
                 ))
             })?;
-            let spi = VIRTIO_SPI_BASE + virtio_idx;
-            let base = VIRTIO_MMIO_BASE + (virtio_idx as u64) * VIRTIO_MMIO_GAP;
-            bus.add(
-                base,
-                VIRTIO_MMIO_SIZE,
-                Box::new(VirtioMmioDevice::new(
-                    Box::new(fs),
-                    spi,
-                    vm_fd.clone(),
-                    mem.clone(),
-                )),
-            );
-            virtio_idx += 1;
+            add_virtio(&mut bus, &mut virtio_idx, Box::new(fs), &vm_fd, &mem)?;
         }
 
         // Virtio net
@@ -198,19 +186,21 @@ impl KvmVm {
             let mac = config
                 .network_mac
                 .unwrap_or([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
-            let spi = VIRTIO_SPI_BASE + virtio_idx;
-            let base = VIRTIO_MMIO_BASE + (virtio_idx as u64) * VIRTIO_MMIO_GAP;
-            bus.add(
-                base,
-                VIRTIO_MMIO_SIZE,
-                Box::new(VirtioMmioDevice::new(
-                    Box::new(NetBackend::new(net_fd, mac)),
-                    spi,
-                    vm_fd.clone(),
-                    mem.clone(),
-                )),
-            );
-            virtio_idx += 1;
+            add_virtio(
+                &mut bus,
+                &mut virtio_idx,
+                Box::new(NetBackend::new(net_fd, mac)),
+                &vm_fd,
+                &mem,
+            )?;
+        }
+
+        // Virtio balloon
+        let mut balloon_control = None;
+        if config.has_balloon {
+            let backend = balloon::BalloonBackend::new(config.memory_bytes);
+            balloon_control = Some(backend.control());
+            add_virtio(&mut bus, &mut virtio_idx, Box::new(backend), &vm_fd, &mem)?;
         }
 
         // Create vCPUs (must exist before GIC init)
@@ -253,11 +243,12 @@ impl KvmVm {
             kvm,
             vm_fd,
             mem,
-            bus: Arc::new(Mutex::new(bus)),
+            bus: Arc::new(bus),
             vcpus,
             vcpu_threads: Vec::new(),
             running: Arc::new(AtomicBool::new(false)),
-            guest_cid,
+            vsock: vsock_control,
+            balloon: balloon_control,
             _gic: gic,
         })
     }
@@ -290,6 +281,9 @@ impl KvmVm {
         }
         for handle in self.vcpu_threads.drain(..) {
             let _ = handle.join();
+        }
+        if let Some(vsock) = &self.vsock {
+            vsock.deactivate();
         }
     }
 }
@@ -547,11 +541,27 @@ fn generate_fdt(
 // vCPU run loop
 // ===========================================================================
 
-fn vcpu_run_loop(mut vcpu: VcpuFd, bus: Arc<Mutex<MmioBus>>, running: Arc<AtomicBool>) {
+fn add_virtio(
+    bus: &mut MmioBus,
+    virtio_idx: &mut u32,
+    backend: Box<dyn VirtioBackend>,
+    vm_fd: &Arc<VmFd>,
+    mem: &GuestMemoryMmap,
+) -> Result<(), VzError> {
+    let spi = VIRTIO_SPI_BASE + *virtio_idx;
+    let base = VIRTIO_MMIO_BASE + (*virtio_idx as u64) * VIRTIO_MMIO_GAP;
+    let device = VirtioMmioDevice::new(backend, base, spi, vm_fd.clone(), mem.clone())
+        .map_err(|e| VzError::new(format!("failed to set up virtio device: {e}")))?;
+    bus.add(base, VIRTIO_MMIO_SIZE, Box::new(device));
+    *virtio_idx += 1;
+    Ok(())
+}
+
+fn vcpu_run_loop(mut vcpu: VcpuFd, bus: Arc<MmioBus>, running: Arc<AtomicBool>) {
     // Install empty handler for SIGRTMIN so KVM_RUN returns EINTR on stop
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = empty_signal_handler as usize;
+        sa.sa_sigaction = empty_signal_handler as *const () as usize;
         sa.sa_flags = libc::SA_SIGINFO;
         libc::sigaction(libc::SIGRTMIN(), &sa, std::ptr::null_mut());
     }
@@ -563,10 +573,10 @@ fn vcpu_run_loop(mut vcpu: VcpuFd, bus: Arc<Mutex<MmioBus>>, running: Arc<Atomic
                 match exit_reason {
                     VcpuExit::MmioRead(addr, data) => {
                         // data is &mut [u8] — write device response directly
-                        bus.lock().unwrap().handle_read(addr, data);
+                        bus.handle_read(addr, data);
                     }
                     VcpuExit::MmioWrite(addr, data) => {
-                        bus.lock().unwrap().handle_write(addr, data);
+                        bus.handle_write(addr, data);
                     }
                     VcpuExit::SystemEvent(..) | VcpuExit::Shutdown => {
                         running.store(false, Ordering::Release);

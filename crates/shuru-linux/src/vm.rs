@@ -1,5 +1,7 @@
+use std::fs::{File, OpenOptions};
 use std::net::TcpStream;
-use std::os::unix::io::FromRawFd;
+use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::unix::net::UnixListener;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -7,7 +9,7 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 
 use crate::configuration::VirtualMachineConfiguration;
 use crate::error::{Result, VzError};
-use crate::kvm::{self, layout};
+use crate::kvm;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VmState {
@@ -19,59 +21,121 @@ pub enum VmState {
     Unknown = -1,
 }
 
+/// Everything a VM needs, already open, for a process that may not open
+/// files itself. There is no virtio-fs: it needs host paths.
+pub struct VmDescriptors {
+    pub kvm: OwnedFd,
+    pub kernel: File,
+    pub initrd: Option<File>,
+    pub disk: Option<File>,
+    pub disk_read_only: bool,
+    pub serial_write: Option<OwnedFd>,
+    pub serial_read: Option<OwnedFd>,
+    pub network: Option<OwnedFd>,
+    pub network_mac: Option<[u8; 6]>,
+    pub cpu_count: usize,
+    pub memory_bytes: u64,
+    pub command_line: String,
+    /// The vsock connection cap, or no vsock device.
+    pub vsock: Option<usize>,
+    pub balloon: bool,
+}
+
 pub struct VirtualMachine {
     vm: Mutex<Option<kvm::KvmVm>>,
-    guest_cid: u64,
     state_tx: Sender<VmState>,
     state_rx: Receiver<VmState>,
     running: Arc<AtomicBool>,
+    // Descriptors the devices use by number.
+    _held: Vec<OwnedFd>,
 }
 
 impl VirtualMachine {
-    pub fn new(config: &VirtualMachineConfiguration) -> Self {
+    pub fn new(config: &VirtualMachineConfiguration) -> Result<Self> {
         let inner = config.inner.borrow();
-        let (state_tx, state_rx) = bounded(1);
-        let running = Arc::new(AtomicBool::new(false));
+        let open = |path: &str, what: &str| {
+            File::open(path).map_err(|e| VzError::new(format!("failed to open {}: {}", what, e)))
+        };
+        let kernel = open(&inner.kernel_path, "kernel")?;
+        let initrd = inner
+            .initrd_path
+            .as_deref()
+            .map(|p| open(p, "initrd"))
+            .transpose()?;
+        let disk = inner
+            .disk_path
+            .as_deref()
+            .map(|p| {
+                OpenOptions::new()
+                    .read(true)
+                    .write(!inner.disk_read_only)
+                    .open(p)
+                    .map_err(|e| VzError::new(format!("failed to open disk: {}", e)))
+            })
+            .transpose()?;
 
         let create_config = kvm::VmCreateConfig {
+            kvm: None,
             cpu_count: inner.cpu_count,
             memory_bytes: inner.memory_size,
-            kernel_path: inner.kernel_path.clone(),
-            initrd_path: inner.initrd_path.clone(),
+            kernel,
+            initrd,
             command_line: inner.command_line.clone(),
             serial_write_fd: inner.serial_write_fd,
             serial_read_fd: inner.serial_read_fd,
-            disk_path: inner.disk_path.clone(),
+            disk,
             disk_read_only: inner.disk_read_only,
             network_fd: inner.network_fd,
             network_mac: inner.network_mac,
             has_vsock: inner.has_socket,
-            guest_cid: layout::GUEST_CID,
+            vsock_connections: kvm::vsock::MAX_CONNECTIONS,
             mounts: inner.mounts.clone(),
+            has_balloon: inner.has_balloon,
         };
+        Self::create(create_config, Vec::new())
+    }
 
-        match kvm::KvmVm::create(create_config) {
-            Ok(kvm_vm) => {
-                let cid = kvm_vm.guest_cid;
-                VirtualMachine {
-                    vm: Mutex::new(Some(kvm_vm)),
-                    guest_cid: cid,
-                    state_tx,
-                    state_rx,
-                    running,
-                }
-            }
-            Err(e) => {
-                eprintln!("shuru: failed to create KVM VM: {}", e);
-                VirtualMachine {
-                    vm: Mutex::new(None),
-                    guest_cid: layout::GUEST_CID,
-                    state_tx,
-                    state_rx,
-                    running,
-                }
-            }
-        }
+    pub fn from_descriptors(descriptors: VmDescriptors) -> Result<Self> {
+        let raw = |fd: &Option<OwnedFd>| fd.as_ref().map(|fd| fd.as_raw_fd());
+        let create_config = kvm::VmCreateConfig {
+            kvm: Some(descriptors.kvm),
+            cpu_count: descriptors.cpu_count,
+            memory_bytes: descriptors.memory_bytes,
+            kernel: descriptors.kernel,
+            initrd: descriptors.initrd,
+            command_line: descriptors.command_line,
+            serial_write_fd: raw(&descriptors.serial_write),
+            serial_read_fd: raw(&descriptors.serial_read),
+            disk: descriptors.disk,
+            disk_read_only: descriptors.disk_read_only,
+            network_fd: raw(&descriptors.network),
+            network_mac: descriptors.network_mac,
+            has_vsock: descriptors.vsock.is_some(),
+            vsock_connections: descriptors.vsock.unwrap_or(0),
+            mounts: Vec::new(),
+            has_balloon: descriptors.balloon,
+        };
+        let held = [
+            descriptors.serial_write,
+            descriptors.serial_read,
+            descriptors.network,
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        Self::create(create_config, held)
+    }
+
+    fn create(create_config: kvm::VmCreateConfig, held: Vec<OwnedFd>) -> Result<Self> {
+        let (state_tx, state_rx) = bounded(1);
+        let kvm_vm = kvm::KvmVm::create(create_config)?;
+        Ok(VirtualMachine {
+            vm: Mutex::new(Some(kvm_vm)),
+            state_tx,
+            state_rx,
+            running: Arc::new(AtomicBool::new(false)),
+            _held: held,
+        })
     }
 
     pub fn supported() -> bool {
@@ -123,6 +187,29 @@ impl VirtualMachine {
         Ok(())
     }
 
+    /// How much memory the guest should keep. The balloon driver in the
+    /// guest hands the rest to the host, and gets it back when the target
+    /// rises again. Fails without a balloon device.
+    pub fn set_memory_target(&self, bytes: u64) -> Result<()> {
+        let vm = self.vm.lock().unwrap();
+        let control = vm
+            .as_ref()
+            .and_then(|v| v.balloon.clone())
+            .ok_or_else(|| VzError::new("no memory balloon device"))?;
+        control.set_memory_target(bytes);
+        Ok(())
+    }
+
+    /// Bytes the guest has handed over in response to the memory target.
+    pub fn ballooned_bytes(&self) -> u64 {
+        self.vm
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|v| v.balloon.as_ref().map(|b| b.ballooned_bytes()))
+            .unwrap_or(0)
+    }
+
     pub fn state_channel(&self) -> Receiver<VmState> {
         self.state_rx.clone()
     }
@@ -146,86 +233,28 @@ impl VirtualMachine {
         self.can_stop()
     }
 
-    /// Connect to a vsock port on the guest via AF_VSOCK.
+    fn vsock(&self) -> Result<Arc<kvm::vsock::VsockControl>> {
+        self.vm
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|vm| vm.vsock.clone())
+            .ok_or_else(|| VzError::new("no vsock device"))
+    }
+
     pub fn connect_to_vsock_port(&self, port: u32) -> Result<TcpStream> {
-        let sock = unsafe { libc::socket(layout::AF_VSOCK, libc::SOCK_STREAM, 0) };
-        if sock < 0 {
-            return Err(VzError::new(format!(
-                "failed to create vsock socket: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
+        self.vsock()?
+            .connect(port)
+            .map_err(|e| VzError::new(format!("vsock connect failed: {e}")))
+    }
 
-        // Use non-blocking connect + poll to implement a 2-second timeout.
-        // SO_SNDTIMEO doesn't work for AF_VSOCK on some kernels.
-        unsafe {
-            let flags = libc::fcntl(sock, libc::F_GETFL);
-            libc::fcntl(sock, libc::F_SETFL, flags | libc::O_NONBLOCK);
-        }
-
-        let addr = libc::sockaddr_vm {
-            svm_family: layout::AF_VSOCK as libc::sa_family_t,
-            svm_reserved1: 0,
-            svm_port: port,
-            svm_cid: self.guest_cid as u32,
-            svm_zero: [0u8; 4],
-        };
-
-        let ret = unsafe {
-            libc::connect(
-                sock,
-                &addr as *const libc::sockaddr_vm as *const libc::sockaddr,
-                std::mem::size_of::<libc::sockaddr_vm>() as libc::socklen_t,
-            )
-        };
-
-        if ret < 0 {
-            let errno = std::io::Error::last_os_error();
-            if errno.raw_os_error() != Some(libc::EINPROGRESS) {
-                unsafe { libc::close(sock) };
-                return Err(VzError::new(format!("vsock connect failed: {}", errno)));
-            }
-
-            // Wait for connect to complete with 2s timeout
-            let mut pfd = libc::pollfd {
-                fd: sock,
-                events: libc::POLLOUT,
-                revents: 0,
-            };
-            let poll_ret = unsafe { libc::poll(&mut pfd, 1, 2000) };
-            if poll_ret <= 0 {
-                unsafe { libc::close(sock) };
-                return Err(VzError::new("vsock connect timed out"));
-            }
-
-            // Check if connect succeeded
-            let mut err: libc::c_int = 0;
-            let mut len: libc::socklen_t = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-            unsafe {
-                libc::getsockopt(
-                    sock,
-                    libc::SOL_SOCKET,
-                    libc::SO_ERROR,
-                    &mut err as *mut _ as *mut libc::c_void,
-                    &mut len,
-                );
-            }
-            if err != 0 {
-                unsafe { libc::close(sock) };
-                return Err(VzError::new(format!(
-                    "vsock connect failed: {}",
-                    std::io::Error::from_raw_os_error(err)
-                )));
-            }
-        }
-
-        // Restore blocking mode for normal I/O
-        unsafe {
-            let flags = libc::fcntl(sock, libc::F_GETFL);
-            libc::fcntl(sock, libc::F_SETFL, flags & !libc::O_NONBLOCK);
-        }
-
-        Ok(unsafe { TcpStream::from_raw_fd(sock) })
+    /// Accepts host connects on `listener` for as long as the VM lives. A
+    /// client writes `CONNECT <guest port>\n` and reads `OK <host port>\n`
+    /// once the guest accepts; a refused connect closes the socket.
+    pub fn serve_vsock(&self, listener: UnixListener) -> Result<()> {
+        self.vsock()?
+            .serve(listener)
+            .map_err(|e| VzError::new(format!("vsock listener failed: {e}")))
     }
 
     pub fn state(&self) -> VmState {

@@ -47,7 +47,7 @@ jobs:
           DATA_DIR="${HOME}/.local/share/shuru"
           tar czf "shuru-os-${VERSION}-aarch64.tar.gz" \
             -C "${DATA_DIR}" \
-            Image initramfs.cpio.gz rootfs.ext4
+            Image initramfs.cpio rootfs.ext4
 
       - name: Upload artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -147,12 +147,16 @@ jobs:
         uses: step-security/action-gh-release@44319d37c8b7966bf07f89f0cbf63408141446df # v3.0.3
         with:
           generate_release_notes: true
+          # A tag with a hyphen (v0.8.0-rc.1) is a rehearsal: published as a
+          # pre-release, never marked latest, never pushed to Homebrew.
+          prerelease: ${{ contains(github.ref_name, '-') }}
           files: artifacts/*
 
   update-homebrew:
     name: Update Homebrew tap
     runs-on: ubuntu-latest
     needs: release
+    if: ${{ !contains(github.ref_name, '-') }}
     steps:
       - name: Harden the runner (Audit all outbound calls)
         uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1

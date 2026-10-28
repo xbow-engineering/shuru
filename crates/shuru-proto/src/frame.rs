@@ -1,5 +1,8 @@
 use std::io::{self, Read, Write};
 
+pub const HELLO: u8 = 0x08;
+pub const HELLO_OK: u8 = 0x09;
+
 // I/O streams
 pub const STDIN: u8 = 0x01;
 pub const STDOUT: u8 = 0x02;
@@ -19,6 +22,8 @@ pub const MOUNT_REQ: u8 = 0x11;
 pub const MOUNT_RESP: u8 = 0x12;
 
 // File I/O
+// File contents travel in frames of at most FILE_CHUNK bytes. A read ends
+// with an empty READ_FILE_RESP; a write sends WriteFileRequest::len bytes.
 pub const READ_FILE_REQ: u8 = 0x13;
 pub const READ_FILE_RESP: u8 = 0x14;
 pub const WRITE_FILE_REQ: u8 = 0x15;
@@ -53,7 +58,13 @@ pub const DISCARD_RESP: u8 = 0x4F;
 pub const DOWNLOAD_REQ: u8 = 0x50;
 pub const DOWNLOAD_PROGRESS: u8 = 0x51;
 
+// Shutdown: host asks the guest to stop its services and sync the disk
+pub const SHUTDOWN_REQ: u8 = 0x60;
+pub const SHUTDOWN_RESP: u8 = 0x61;
+
 const MAX_FRAME: u32 = 1 << 20; // 1 MB
+
+pub const FILE_CHUNK: usize = 256 * 1024;
 
 /// Write a binary frame: `[u32 BE length][u8 type][payload]`.
 ///
@@ -98,7 +109,7 @@ pub fn read_frame(r: &mut impl Read) -> io::Result<Option<(u8, Vec<u8>)>> {
 
 /// Serialize `msg` as JSON and send it as a typed frame.
 pub fn send_json(w: &mut impl Write, msg_type: u8, msg: &impl serde::Serialize) -> io::Result<()> {
-    let payload = serde_json::to_vec(msg).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let payload = serde_json::to_vec(msg).map_err(io::Error::other)?;
     write_frame(w, msg_type, &payload)
 }
 
@@ -153,3 +164,14 @@ pub fn parse_exit_code(payload: &[u8]) -> Option<i32> {
         payload[0], payload[1], payload[2], payload[3],
     ]))
 }
+
+// Disk sealing uses a lease id so a stale thaw cannot release a later seal.
+pub const SEAL_REQ: u8 = 0x62;
+pub const SEAL_RESP: u8 = 0x63;
+pub const THAW_REQ: u8 = 0x64;
+pub const THAW_RESP: u8 = 0x65;
+pub const TRIM_REQ: u8 = 0x66;
+pub const TRIM_RESP: u8 = 0x67;
+
+pub const KILL_REQ: u8 = 0x18;
+pub const KILL_RESP: u8 = 0x19;

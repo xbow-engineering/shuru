@@ -11,7 +11,8 @@ use objc2_foundation::{
     NSKeyValueObservingOptions, NSObject, NSObjectNSKeyValueObserverRegistration, NSString,
 };
 use objc2_virtualization::{
-    VZVirtioSocketConnection, VZVirtioSocketDevice, VZVirtualMachine, VZVirtualMachineState,
+    VZVirtioSocketConnection, VZVirtioSocketDevice, VZVirtioTraditionalMemoryBalloonDevice,
+    VZVirtualMachine, VZVirtualMachineState,
 };
 
 use crate::configuration::VirtualMachineConfiguration;
@@ -218,6 +219,32 @@ impl VirtualMachine {
             .map_err(|_| VzError::new("VM stop channel closed"))?
     }
 
+    /// How much memory the guest should keep. The framework rounds the
+    /// value down to a megabyte and clamps it to the configured size; the
+    /// guest responds in its own time. Fails without a balloon device.
+    pub fn set_memory_target(&self, bytes: u64) -> Result<()> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let machine = ThreadSafe(self.ctx.machine.0.clone());
+
+        let dispatch_block = RcBlock::new(move || {
+            let devices = unsafe { machine.memoryBalloonDevices() };
+            let result = match devices.firstObject() {
+                Some(device) => {
+                    let device: Retained<VZVirtioTraditionalMemoryBalloonDevice> =
+                        unsafe { Retained::cast_unchecked(device) };
+                    unsafe { device.setTargetVirtualMachineMemorySize(bytes) };
+                    Ok(())
+                }
+                None => Err(VzError::new("no memory balloon device")),
+            };
+            let _ = tx.send(result);
+        });
+
+        self.queue.exec_block_async(&dispatch_block);
+
+        rx.recv().map_err(|_| VzError::new("VM queue closed"))?
+    }
+
     pub fn can_start(&self) -> bool {
         self.queue
             .exec_sync(move || unsafe { self.ctx.machine.canStart() })
@@ -297,8 +324,21 @@ impl VirtualMachine {
 
         self.queue.exec_block_async(&dispatch_block);
 
-        rx.recv()
-            .map_err(|_| VzError::new("vsock connection channel closed"))?
+        // The framework never calls the completion handler when the VM
+        // stops while a connect is pending.
+        loop {
+            match rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                Ok(result) => return result,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if matches!(self.state(), VmState::Stopped | VmState::Error) {
+                        return Err(VzError::new("VM stopped during vsock connect"));
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(VzError::new("vsock connection channel closed"));
+                }
+            }
+        }
     }
 
     pub fn state(&self) -> VmState {

@@ -3,6 +3,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use boring::ssl::{SslConnector, SslMethod};
+use boring::x509::store::X509StoreBuilder;
+use boring::x509::X509;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -12,7 +14,7 @@ use crate::config::ProxyConfig;
 use crate::dns;
 use crate::secrets::SecretResolver;
 use crate::stack::{ConnectionId, StackCommand, StackEvent, TcpConnection};
-use crate::stream::ChannelStream;
+use crate::stream::{ChannelStream, GuestRx, GuestTx};
 use crate::substitute::RequestStream;
 use crate::tls::CertificateAuthority;
 use crate::AllowedIps;
@@ -30,14 +32,33 @@ const SECRET_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_s
 /// Cloudflare-protected sites accept the TLS fingerprint. The client-side
 /// (guest <-> proxy) uses rustls with our generated CA cert.
 pub struct ProxyEngine {
-    config: Arc<ProxyConfig>,
     event_rx: mpsc::UnboundedReceiver<StackEvent>,
     cmd_tx: mpsc::UnboundedSender<StackCommand>,
     connections: HashMap<ConnectionId, mpsc::UnboundedSender<Vec<u8>>>,
-    secrets: Arc<SecretResolver>,
-    ca: Arc<tokio::sync::Mutex<CertificateAuthority>>,
+    shared: Arc<Shared>,
+}
+
+/// State every connection task reads.
+struct Shared {
+    config: Arc<ProxyConfig>,
+    ca: tokio::sync::Mutex<CertificateAuthority>,
+    secrets: SecretResolver,
     upstream_ssl: SslConnector,
     allowed_ips: AllowedIps,
+}
+
+/// The guest side of one proxied connection.
+struct Guest {
+    id: ConnectionId,
+    rx: GuestRx,
+    tx: GuestTx,
+    cmd_tx: mpsc::UnboundedSender<StackCommand>,
+}
+
+impl Guest {
+    fn close(&self) {
+        let _ = self.cmd_tx.send(StackCommand::Close { id: self.id });
+    }
 }
 
 impl ProxyEngine {
@@ -48,25 +69,22 @@ impl ProxyEngine {
         ca: CertificateAuthority,
         placeholders: HashMap<String, String>,
         allowed_ips: AllowedIps,
+        upstream_ssl: SslConnector,
     ) -> Self {
-        // BoringSSL upstream connector — Chrome's TLS stack so Cloudflare
-        // doesn't reject our MITM connections based on JA3/JA4 fingerprint.
-        let mut builder = SslConnector::builder(SslMethod::tls()).expect("SslConnector");
-        builder.set_alpn_protos(b"\x08http/1.1").expect("ALPN");
-        let upstream_ssl = builder.build();
-
         let config = Arc::new(config);
-        let secrets = Arc::new(SecretResolver::new(config.clone(), placeholders));
+        let secrets = SecretResolver::new(config.clone(), placeholders);
 
         ProxyEngine {
-            config,
             event_rx,
             cmd_tx,
             connections: HashMap::new(),
-            secrets,
-            ca: Arc::new(tokio::sync::Mutex::new(ca)),
-            upstream_ssl,
-            allowed_ips,
+            shared: Arc::new(Shared {
+                config,
+                ca: tokio::sync::Mutex::new(ca),
+                secrets,
+                upstream_ssl,
+                allowed_ips,
+            }),
         }
     }
 
@@ -88,12 +106,23 @@ impl ProxyEngine {
                 StackEvent::Closed { id } => {
                     self.connections.remove(&id);
                 }
-                StackEvent::DnsQuery { src, payload } => {
+                StackEvent::DnsQuery {
+                    src,
+                    payload,
+                    permit,
+                } => {
                     let cmd_tx = self.cmd_tx.clone();
-                    let config = self.config.clone();
-                    let allowed_ips = self.allowed_ips.clone();
+                    let shared = self.shared.clone();
                     tokio::spawn(async move {
-                        dns::handle_dns_query(src, payload, cmd_tx, &config, &allowed_ips).await;
+                        dns::handle_dns_query(
+                            src,
+                            payload,
+                            cmd_tx,
+                            &shared.config,
+                            &shared.allowed_ips,
+                        )
+                        .await;
+                        drop(permit);
                     });
                 }
             }
@@ -103,46 +132,54 @@ impl ProxyEngine {
     fn handle_new_connection(&mut self, conn: TcpConnection) {
         let (data_tx, data_rx) = mpsc::unbounded_channel();
         self.connections.insert(conn.id, data_tx);
-
-        let cmd_tx = self.cmd_tx.clone();
-        let config = self.config.clone();
-        let ca = self.ca.clone();
-        let secrets = self.secrets.clone();
-        let upstream_ssl = self.upstream_ssl.clone();
-        let allowed_ips = self.allowed_ips.clone();
+        let guest = Guest {
+            id: conn.id,
+            rx: GuestRx::new(conn.id, data_rx, self.cmd_tx.clone()),
+            tx: GuestTx::new(conn.id, self.cmd_tx.clone(), conn.to_guest),
+            cmd_tx: self.cmd_tx.clone(),
+        };
+        let shared = self.shared.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(
-                conn.id,
-                conn.dst,
-                data_rx,
-                cmd_tx,
-                &config,
-                ca,
-                secrets,
-                upstream_ssl,
-                &allowed_ips,
-            )
-            .await
-            {
+            if let Err(e) = handle_connection(guest, conn.dst, &shared).await {
                 debug!("connection to {} ended: {e}", conn.dst);
             }
         });
     }
 }
 
+/// Upstream TLS goes through BoringSSL, the TLS stack of Chrome, so Cloudflare
+/// does not reject relayed connections by their JA3/JA4 fingerprint.
+pub fn upstream_connector(config: &ProxyConfig) -> anyhow::Result<SslConnector> {
+    let mut builder = SslConnector::builder(SslMethod::tls())?;
+    builder.set_alpn_protos(b"\x08http/1.1")?;
+    if let Some(pem) = &config.upstream_roots {
+        let certs = X509::stack_from_pem(pem)?;
+        if certs.is_empty() {
+            anyhow::bail!("no certificates in the upstream roots");
+        }
+        let mut store = X509StoreBuilder::new()?;
+        for cert in certs {
+            store.add_cert(cert)?;
+        }
+        builder.set_cert_store_builder(store);
+    }
+    Ok(builder.build())
+}
+
 /// Handle a single proxied TCP connection.
 async fn handle_connection(
-    id: ConnectionId,
+    mut guest: Guest,
     dst: SocketAddr,
-    mut data_rx: mpsc::UnboundedReceiver<Vec<u8>>,
-    cmd_tx: mpsc::UnboundedSender<StackCommand>,
-    config: &ProxyConfig,
-    ca: Arc<tokio::sync::Mutex<CertificateAuthority>>,
-    secrets: Arc<SecretResolver>,
-    upstream_ssl: SslConnector,
-    allowed_ips: &AllowedIps,
+    shared: &Shared,
 ) -> anyhow::Result<()> {
+    let config = &shared.config;
+    if config.public_only && !crate::config::is_public(dst.ip()) {
+        guest.close();
+        return Err(anyhow::anyhow!(
+            "connection to {dst} blocked: not a public address"
+        ));
+    }
     // Check if this is a connection to an exposed host port (host.shuru.internal).
     if let std::net::IpAddr::V4(ipv4) = dst.ip() {
         if let Some(host_port) = config.exposed_host_port(ipv4, dst.port()) {
@@ -157,7 +194,7 @@ async fn handle_connection(
             );
             let upstream = TcpStream::connect(local_dst).await?;
             let (mut upstream_rd, mut upstream_wr) = upstream.into_split();
-            return blind_relay(id, &mut upstream_rd, &mut upstream_wr, data_rx, cmd_tx).await;
+            return blind_relay(guest, &mut upstream_rd, &mut upstream_wr).await;
         }
     }
 
@@ -172,14 +209,15 @@ async fn handle_connection(
         if let std::net::IpAddr::V4(ipv4) = dst.ip() {
             const GATEWAY: std::net::Ipv4Addr = std::net::Ipv4Addr::new(10, 0, 0, 1);
             let is_allowed = ipv4 == GATEWAY
-                || allowed_ips
+                || shared
+                    .allowed_ips
                     .write()
                     .expect("allowed_ips lock poisoned")
                     .get(&ipv4)
                     .is_some();
             if !is_allowed {
                 debug!("IP not in DNS-pinned set, rejecting: {dst}");
-                let _ = cmd_tx.send(StackCommand::Close { id });
+                guest.close();
                 return Err(anyhow::anyhow!(
                     "connection to {dst} blocked: IP not resolved via allowed DNS"
                 ));
@@ -192,7 +230,8 @@ async fn handle_connection(
     if is_tls {
         // Buffer data until we have a complete TLS ClientHello record.
         // The ClientHello may span multiple TCP segments.
-        let mut tls_buf = data_rx
+        let mut tls_buf = guest
+            .rx
             .recv()
             .await
             .ok_or_else(|| anyhow::anyhow!("connection closed before data"))?;
@@ -204,7 +243,7 @@ async fn handle_connection(
             if tls_buf.len() >= 5 + record_len {
                 break; // have the complete record
             }
-            match data_rx.recv().await {
+            match guest.rx.recv().await {
                 Some(chunk) => tls_buf.extend_from_slice(&chunk),
                 None => break, // connection closed
             }
@@ -220,14 +259,14 @@ async fn handle_connection(
             match &sni {
                 Some(domain) if !config.is_domain_allowed(domain) => {
                     debug!("SNI not in allowlist, rejecting: {domain}");
-                    let _ = cmd_tx.send(StackCommand::Close { id });
+                    guest.close();
                     return Err(anyhow::anyhow!(
                         "TLS to {dst} blocked: SNI '{domain}' not in allowlist"
                     ));
                 }
                 None => {
                     debug!("no SNI in ClientHello, rejecting connection to {dst}");
-                    let _ = cmd_tx.send(StackCommand::Close { id });
+                    guest.close();
                     return Err(anyhow::anyhow!("TLS to {dst} blocked: no SNI"));
                 }
                 _ => {}
@@ -237,31 +276,19 @@ async fn handle_connection(
         if let Some(domain) = sni {
             // Resolved per connection, so a rotated secret is picked up by the
             // next connection to the domain without the guest noticing.
-            let substitutions = match secrets.substitutions_for_domain(&domain).await {
+            let substitutions = match shared.secrets.substitutions_for_domain(&domain).await {
                 Ok(substitutions) => substitutions,
                 Err(e) => {
                     // Warn rather than debug: the guest only sees a dropped
                     // TLS connection, so this is the sole account of why.
                     warn!("TLS to {domain} blocked: {e:#}");
-                    let _ = cmd_tx.send(StackCommand::Close { id });
+                    guest.close();
                     return Err(e.context(format!("TLS to {domain} blocked")));
                 }
             };
             if !substitutions.is_empty() {
                 debug!("MITM: {domain}");
-                return handle_mitm(
-                    id,
-                    dst,
-                    domain,
-                    tls_buf,
-                    data_rx,
-                    cmd_tx,
-                    ca,
-                    secrets,
-                    substitutions,
-                    upstream_ssl,
-                )
-                .await;
+                return handle_mitm(guest, dst, domain, tls_buf, substitutions, shared).await;
             }
         }
 
@@ -273,7 +300,7 @@ async fn handle_connection(
         // Send the buffered TLS data
         upstream_wr.write_all(&tls_buf).await?;
 
-        return blind_relay(id, &mut upstream_rd, &mut upstream_wr, data_rx, cmd_tx).await;
+        return blind_relay(guest, &mut upstream_rd, &mut upstream_wr).await;
     }
 
     // Non-TLS: blind tunnel
@@ -281,31 +308,28 @@ async fn handle_connection(
     let upstream = TcpStream::connect(dst).await?;
     let (mut upstream_rd, mut upstream_wr) = upstream.into_split();
 
-    blind_relay(id, &mut upstream_rd, &mut upstream_wr, data_rx, cmd_tx).await
+    blind_relay(guest, &mut upstream_rd, &mut upstream_wr).await
 }
 
 /// Blind bidirectional relay (no inspection).
 async fn blind_relay(
-    id: ConnectionId,
+    guest: Guest,
     upstream_rd: &mut tokio::net::tcp::OwnedReadHalf,
     upstream_wr: &mut tokio::net::tcp::OwnedWriteHalf,
-    mut data_rx: mpsc::UnboundedReceiver<Vec<u8>>,
-    cmd_tx: mpsc::UnboundedSender<StackCommand>,
 ) -> anyhow::Result<()> {
-    let cmd_tx_clone = cmd_tx.clone();
+    let Guest {
+        id,
+        rx: mut guest_rx,
+        tx: guest_tx,
+        cmd_tx,
+    } = guest;
     let upstream_to_guest = async {
         let mut buf = vec![0u8; 65536];
         loop {
             match upstream_rd.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    if cmd_tx_clone
-                        .send(StackCommand::Send {
-                            id,
-                            payload: buf[..n].to_vec(),
-                        })
-                        .is_err()
-                    {
+                    if guest_tx.send(&buf[..n]).await.is_err() {
                         break;
                     }
                 }
@@ -314,7 +338,7 @@ async fn blind_relay(
     };
 
     let guest_to_upstream = async {
-        while let Some(payload) = data_rx.recv().await {
+        while let Some(payload) = guest_rx.recv().await {
             if upstream_wr.write_all(&payload).await.is_err() {
                 break;
             }
@@ -332,23 +356,21 @@ async fn blind_relay(
 
 /// MITM: terminate TLS on both sides, relay HTTP/1.1 with secret substitution.
 async fn handle_mitm(
-    id: ConnectionId,
+    guest: Guest,
     dst: SocketAddr,
     domain: String,
     first_chunk: Vec<u8>,
-    data_rx: mpsc::UnboundedReceiver<Vec<u8>>,
-    cmd_tx: mpsc::UnboundedSender<StackCommand>,
-    ca: Arc<tokio::sync::Mutex<CertificateAuthority>>,
-    secrets: Arc<SecretResolver>,
     substitutions: Vec<(String, String)>,
-    upstream_ssl: SslConnector,
+    shared: &Shared,
 ) -> anyhow::Result<()> {
     let acceptor = {
-        let mut ca = ca.lock().await;
+        let mut ca = shared.ca.lock().await;
         ca.acceptor_for_domain(&domain)?
     };
 
-    let mut guest_stream = ChannelStream::new(id, data_rx, cmd_tx.clone());
+    let Guest { id, rx, tx, cmd_tx } = guest;
+    let secrets = &shared.secrets;
+    let mut guest_stream = ChannelStream::new(rx, tx);
     guest_stream.prepend(first_chunk);
 
     // Client-side: rustls with our generated CA cert
@@ -356,9 +378,10 @@ async fn handle_mitm(
 
     // Upstream: BoringSSL — Chrome's TLS fingerprint passes Cloudflare
     let upstream_tcp = TcpStream::connect(dst).await?;
-    let upstream_tls = tokio_boring::connect(upstream_ssl.configure()?, &domain, upstream_tcp)
-        .await
-        .map_err(|e| anyhow::anyhow!("BoringSSL connect to {domain}: {e}"))?;
+    let upstream_tls =
+        tokio_boring::connect(shared.upstream_ssl.configure()?, &domain, upstream_tcp)
+            .await
+            .map_err(|e| anyhow::anyhow!("BoringSSL connect to {domain}: {e}"))?;
 
     // HTTP/1.1 text-based relay with secret substitution
     let (mut guest_rd, mut guest_wr) = tokio::io::split(guest_tls);
@@ -506,5 +529,20 @@ mod tests {
     fn test_extract_sni_none_for_non_tls() {
         assert_eq!(extract_sni(b"GET / HTTP/1.1\r\n"), None);
         assert_eq!(extract_sni(&[]), None);
+    }
+
+    #[test]
+    fn upstream_roots_must_parse() {
+        let pem = CertificateAuthority::new().unwrap().ca_cert_pem();
+        let config = ProxyConfig {
+            upstream_roots: Some(pem),
+            ..Default::default()
+        };
+        assert!(upstream_connector(&config).is_ok());
+        let config = ProxyConfig {
+            upstream_roots: Some(b"not a certificate".to_vec()),
+            ..Default::default()
+        };
+        assert!(upstream_connector(&config).is_err());
     }
 }

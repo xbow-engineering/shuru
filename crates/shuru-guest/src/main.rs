@@ -1,3 +1,15 @@
+#[cfg(any(target_os = "linux", test))]
+mod identity;
+
+#[cfg(any(target_os = "linux", test))]
+mod ext4;
+
+#[cfg(target_os = "linux")]
+mod services;
+
+#[cfg(target_os = "linux")]
+mod disk;
+
 #[cfg(target_os = "linux")]
 mod guest {
     use std::io::{Read, Write};
@@ -14,6 +26,10 @@ mod guest {
         WriteFileResponse,
     };
     use shuru_proto::{VSOCK_PORT, VSOCK_PORT_FORWARD};
+
+    /// Process groups of running execs, by the id the host started them with.
+    static EXECS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<u64, i32>>> =
+        std::sync::LazyLock::new(Default::default);
 
     fn uptime_ms() -> f64 {
         let mut ts = libc::timespec {
@@ -38,7 +54,7 @@ mod guest {
             if libc::fcntl(2, libc::F_GETFD) >= 0 {
                 return;
             }
-            let fd = libc::open(b"/dev/null\0".as_ptr() as *const libc::c_char, libc::O_RDWR);
+            let fd = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
             if fd >= 0 {
                 for t in 0..3 {
                     libc::dup2(fd, t);
@@ -92,9 +108,9 @@ mod guest {
     }
 
     fn mount_filesystems() {
-        mount_fs("proc", "/proc", "proc", None);
-        mount_fs("sysfs", "/sys", "sysfs", None);
-        mount_fs("devtmpfs", "/dev", "devtmpfs", None);
+        assert!(mount_fs("proc", "/proc", "proc", None));
+        assert!(mount_fs("sysfs", "/sys", "sysfs", None));
+        assert!(mount_fs("devtmpfs", "/dev", "devtmpfs", None));
         std::fs::create_dir_all("/dev/pts").ok();
         mount_fs(
             "devpts",
@@ -103,6 +119,48 @@ mod guest {
             Some("newinstance,ptmxmode=0666"),
         );
         mount_fs("tmpfs", "/tmp", "tmpfs", None);
+        // Runtime state lives on tmpfs so pid files and sockets never land in
+        // a checkpoint. A stale /run/docker.pid otherwise blocks dockerd on
+        // the next boot.
+        // Both are guest RAM, so cap them well below the VM memory.
+        assert!(mount_fs(
+            "tmpfs",
+            "/run",
+            "tmpfs",
+            Some("mode=0755,size=64m")
+        ));
+        std::fs::create_dir_all("/run/lock").ok();
+        std::fs::create_dir_all("/dev/shm").ok();
+        mount_fs("tmpfs", "/dev/shm", "tmpfs", Some("mode=1777,size=256m"));
+        mount_cgroup2();
+    }
+
+    /// Unified cgroup hierarchy with every controller delegated below the
+    /// root, which is what runc and containerd expect to find.
+    fn mount_cgroup2() {
+        if !mount_fs(
+            "cgroup2",
+            "/sys/fs/cgroup",
+            "cgroup2",
+            Some("nsdelegate,memory_recursiveprot"),
+        ) {
+            return;
+        }
+        let controllers = match std::fs::read_to_string("/sys/fs/cgroup/cgroup.controllers") {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        for name in controllers.split_whitespace() {
+            if let Err(e) = std::fs::write(
+                "/sys/fs/cgroup/cgroup.subtree_control",
+                format!("+{}", name),
+            ) {
+                eprintln!(
+                    "shuru-guest: failed to enable cgroup controller {}: {}",
+                    name, e
+                );
+            }
+        }
     }
 
     fn process_mount(req: &MountRequest) -> MountResponse {
@@ -189,7 +247,7 @@ mod guest {
             let copy_len = name.len().min(libc::IFNAMSIZ);
             std::ptr::copy_nonoverlapping(
                 name.as_ptr(),
-                ifr.ifr_name.as_mut_ptr() as *mut u8,
+                ifr.ifr_name.as_mut_ptr().cast::<u8>(),
                 copy_len,
             );
 
@@ -207,63 +265,61 @@ mod guest {
     }
 
     // --- Networking setup ---
-    // Network is configured by initramfs before switch_root (static IP for proxy).
-    // By the time we get here, eth0 already has an IP if --allow-net was used.
-
     fn setup_networking() {
         unsafe {
             let sock = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
             if sock < 0 {
-                eprintln!("shuru-guest: failed to create socket for networking setup");
-                return;
+                panic!("network socket: {}", std::io::Error::last_os_error());
             }
-
             bring_up_interface(sock, b"lo\0");
-
-            // Check if eth0 exists (network device present)
-            let has_eth0 = {
-                let mut ifr: libc::ifreq = std::mem::zeroed();
-                std::ptr::copy_nonoverlapping(
-                    b"eth0\0".as_ptr(),
-                    ifr.ifr_name.as_mut_ptr() as *mut u8,
-                    5,
-                );
-                libc::ioctl(sock, libc::SIOCGIFFLAGS as _, &mut ifr) == 0
-            };
-
-            if !has_eth0 {
+            let mut ifr: libc::ifreq = std::mem::zeroed();
+            std::ptr::copy_nonoverlapping(c"eth0".as_ptr(), ifr.ifr_name.as_mut_ptr(), 5);
+            if libc::ioctl(sock, libc::SIOCGIFFLAGS as _, &mut ifr) < 0 {
                 libc::close(sock);
-                eprintln!("shuru-guest: no network device (sandbox mode)");
                 return;
             }
-
-            // Check if eth0 already has an IP (configured by initramfs)
-            let has_ip = {
-                let mut ifr: libc::ifreq = std::mem::zeroed();
-                std::ptr::copy_nonoverlapping(
-                    b"eth0\0".as_ptr(),
-                    ifr.ifr_name.as_mut_ptr() as *mut u8,
-                    5,
-                );
-                libc::ioctl(sock, libc::SIOCGIFADDR as _, &mut ifr) == 0
-            };
-
-            libc::close(sock);
-
-            if has_ip {
-                eprintln!("shuru-guest: network already configured (by initramfs)");
-            } else {
-                eprintln!("shuru-guest: eth0 present but no IP configured");
+            fn address(bytes: [u8; 4]) -> libc::sockaddr {
+                let addr = libc::sockaddr_in {
+                    sin_family: libc::AF_INET as _,
+                    sin_port: 0,
+                    sin_addr: libc::in_addr {
+                        s_addr: u32::from_ne_bytes(bytes),
+                    },
+                    sin_zero: [0; 8],
+                };
+                unsafe { std::mem::transmute(addr) }
             }
+            for (op, addr) in [
+                (libc::SIOCSIFADDR, [10, 0, 0, 2]),
+                (libc::SIOCSIFNETMASK, [255, 255, 255, 0]),
+            ] {
+                ifr.ifr_ifru.ifru_addr = address(addr);
+                if libc::ioctl(sock, op as _, &ifr) < 0 {
+                    panic!("network address: {}", std::io::Error::last_os_error());
+                }
+            }
+            bring_up_interface(sock, b"eth0\0");
+            let mut route: libc::rtentry = std::mem::zeroed();
+            route.rt_dst = address([0; 4]);
+            route.rt_genmask = address([0; 4]);
+            route.rt_gateway = address([10, 0, 0, 1]);
+            route.rt_flags = (libc::RTF_UP | libc::RTF_GATEWAY) as _;
+            if libc::ioctl(sock, libc::SIOCADDRT as _, &route) < 0 {
+                panic!("network route: {}", std::io::Error::last_os_error());
+            }
+            libc::close(sock);
         }
+        std::fs::write("/etc/resolv.conf", "nameserver 10.0.0.1\n").expect("configure DNS");
     }
 
     fn reap_zombies() {
         loop {
-            let ret = unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) };
+            let mut status: libc::c_int = 0;
+            let ret = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
             if ret <= 0 {
                 break;
             }
+            crate::services::reaped(ret, status);
         }
     }
 
@@ -346,20 +402,75 @@ mod guest {
         }
     }
 
-    fn handle_connection(fd: i32) {
+    fn authenticate(
+        stream: &mut std::net::TcpStream,
+        identity: &shuru_proto::hello::Identity,
+    ) -> std::io::Result<()> {
+        let timeout = Some(std::time::Duration::from_secs(2));
+        stream.set_read_timeout(timeout)?;
+        stream.set_write_timeout(timeout)?;
+        identity.accept(stream)?;
+        stream.set_read_timeout(None)?;
+        stream.set_write_timeout(None)
+    }
+
+    fn handle_connection(fd: i32, identity: shuru_proto::hello::Identity) {
         // SAFETY: fd is a valid socket from accept()
-        let stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
+        let mut stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
+        if authenticate(&mut stream, &identity).is_err() {
+            return;
+        }
         let _ = stream.set_nodelay(true);
         let mut reader = stream.try_clone().expect("failed to clone stream");
         let mut writer = stream;
 
-        loop {
-            let (msg_type, payload) = match frame::read_frame(&mut reader) {
-                Ok(Some(f)) => f,
-                _ => break, // EOF or error
-            };
-
+        // Ends on EOF or a read error.
+        while let Ok(Some((msg_type, payload))) = frame::read_frame(&mut reader) {
+            if crate::disk::busy() && !matches!(msg_type, frame::THAW_REQ | frame::SEAL_REQ) {
+                let _ = frame::write_frame(&mut writer, frame::ERROR, b"root seal is active");
+                return;
+            }
             match msg_type {
+                frame::SEAL_REQ | frame::THAW_REQ => {
+                    let result = if msg_type == frame::SEAL_REQ {
+                        serde_json::from_slice::<shuru_proto::SealRequest>(&payload)
+                            .map_err(std::io::Error::other)
+                            .and_then(crate::disk::seal)
+                    } else {
+                        serde_json::from_slice::<shuru_proto::ThawRequest>(&payload)
+                            .map_err(std::io::Error::other)
+                            .and_then(|r| crate::disk::thaw(r.id))
+                    };
+                    match result {
+                        Ok(resp) => {
+                            let _ = frame::send_json(&mut writer, msg_type + 1, &resp);
+                        }
+                        Err(e) => {
+                            let _ = frame::write_frame(
+                                &mut writer,
+                                frame::ERROR,
+                                e.to_string().as_bytes(),
+                            );
+                        }
+                    }
+                }
+                frame::KILL_REQ => {
+                    if let Ok(req) = serde_json::from_slice::<shuru_proto::KillRequest>(&payload) {
+                        if let Some(pgid) = EXECS.lock().unwrap().get(&req.id) {
+                            unsafe { libc::kill(-pgid, libc::SIGKILL) };
+                        }
+                    }
+                    let _ = frame::write_frame(&mut writer, frame::KILL_RESP, &[]);
+                }
+                frame::TRIM_REQ => match crate::disk::trim() {
+                    Ok(resp) => {
+                        let _ = frame::send_json(&mut writer, frame::TRIM_RESP, &resp);
+                    }
+                    Err(e) => {
+                        let _ =
+                            frame::write_frame(&mut writer, frame::ERROR, e.to_string().as_bytes());
+                    }
+                },
                 frame::MOUNT_REQ => {
                     let mount_req: MountRequest = match serde_json::from_slice(&payload) {
                         Ok(r) => r,
@@ -384,6 +495,13 @@ mod guest {
 
                     if req.argv.is_empty() {
                         let _ = frame::write_frame(&mut writer, frame::ERROR, b"empty argv");
+                        continue;
+                    }
+
+                    // Services declared by the image must be ready before a
+                    // command runs against them (RFC 0004).
+                    if let Err(msg) = crate::services::wait_ready() {
+                        let _ = frame::write_frame(&mut writer, frame::ERROR, msg.as_bytes());
                         continue;
                     }
 
@@ -534,72 +652,86 @@ mod guest {
                     };
                     handle_download(&req, &mut writer);
                 }
+                frame::SHUTDOWN_REQ => {
+                    let resp = crate::services::shutdown();
+                    match crate::disk::sync() {
+                        Ok(()) => {
+                            let _ = frame::send_json(&mut writer, frame::SHUTDOWN_RESP, &resp);
+                        }
+                        Err(e) => {
+                            let _ = frame::write_frame(
+                                &mut writer,
+                                frame::ERROR,
+                                e.to_string().as_bytes(),
+                            );
+                        }
+                    }
+                }
                 _ => {} // unknown type, skip
             }
         }
     }
 
     fn handle_read_file(req: &ReadFileRequest, writer: &mut impl Write) {
-        match std::fs::read(&req.path) {
-            Ok(data) => {
-                let _ = frame::write_frame(writer, frame::READ_FILE_RESP, &data);
-            }
-            Err(e) => {
-                let msg = format!("read_file {}: {}", req.path, e);
-                let _ = frame::write_frame(writer, frame::ERROR, msg.as_bytes());
+        let fail = |writer: &mut _, e: std::io::Error| {
+            let msg = format!("read_file {}: {}", req.path, e);
+            let _ = frame::write_frame(writer, frame::ERROR, msg.as_bytes());
+        };
+        let mut file = match std::fs::File::open(&req.path) {
+            Ok(f) => f,
+            Err(e) => return fail(writer, e),
+        };
+        let mut buf = vec![0u8; frame::FILE_CHUNK];
+        loop {
+            match file.read(&mut buf) {
+                Ok(n) => {
+                    if frame::write_frame(writer, frame::READ_FILE_RESP, &buf[..n]).is_err()
+                        || n == 0
+                    {
+                        return;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return fail(writer, e),
             }
         }
     }
 
     fn handle_write_file(req: &WriteFileRequest, reader: &mut impl Read, writer: &mut impl Write) {
-        let data = match frame::read_frame(reader) {
-            Ok(Some((frame::WRITE_FILE_DATA, payload))) => payload,
-            _ => {
-                let resp = WriteFileResponse {
-                    ok: false,
-                    error: Some("expected WRITE_FILE_DATA frame".into()),
-                };
-                let _ = frame::send_json(writer, frame::WRITE_FILE_RESP, &resp);
-                return;
-            }
-        };
-
-        if data.len() as u64 != req.len {
+        let respond = |writer: &mut _, error: Option<String>| {
             let resp = WriteFileResponse {
-                ok: false,
-                error: Some(format!(
-                    "length mismatch: expected {}, got {}",
-                    req.len,
-                    data.len()
-                )),
+                ok: error.is_none(),
+                error,
             };
             let _ = frame::send_json(writer, frame::WRITE_FILE_RESP, &resp);
-            return;
-        }
+        };
 
         if let Some(parent) = std::path::Path::new(&req.path).parent() {
             let _ = std::fs::create_dir_all(parent);
         }
+        let mut file =
+            std::fs::File::create(&req.path).map_err(|e| format!("write_file {}: {}", req.path, e));
 
-        match std::fs::write(&req.path, &data) {
-            Ok(()) => {
-                unsafe {
-                    libc::sync();
-                }
-                let resp = WriteFileResponse {
-                    ok: true,
-                    error: None,
-                };
-                let _ = frame::send_json(writer, frame::WRITE_FILE_RESP, &resp);
+        // Every chunk is read even after a failure, so the host gets the
+        // error rather than a closed connection.
+        let mut received = 0u64;
+        while received < req.len {
+            let chunk = match frame::read_frame(reader) {
+                Ok(Some((frame::WRITE_FILE_DATA, chunk))) if !chunk.is_empty() => chunk,
+                _ => return respond(writer, Some("expected WRITE_FILE_DATA frame".into())),
+            };
+            received += chunk.len() as u64;
+            if received > req.len {
+                let msg = format!("length mismatch: expected {}, got {}", req.len, received);
+                return respond(writer, Some(msg));
             }
-            Err(e) => {
-                let resp = WriteFileResponse {
-                    ok: false,
-                    error: Some(format!("write_file {}: {}", req.path, e)),
-                };
-                let _ = frame::send_json(writer, frame::WRITE_FILE_RESP, &resp);
+            if let Ok(f) = &mut file {
+                if let Err(e) = f.write_all(&chunk) {
+                    file = Err(format!("write_file {}: {}", req.path, e));
+                }
             }
         }
+        respond(writer, file.err());
     }
 
     fn send_fs_ok(writer: &mut impl Write) {
@@ -1048,6 +1180,9 @@ mod guest {
         match cmd.spawn() {
             Ok(mut child) => {
                 let child_pid = child.id() as i32;
+                if let Some(id) = req.id {
+                    EXECS.lock().unwrap().insert(id, child_pid);
+                }
 
                 // Channel serializes all frame writes to prevent interleaving
                 let (tx, rx) = std::sync::mpsc::channel::<(u8, Vec<u8>)>();
@@ -1098,6 +1233,18 @@ mod guest {
                     }
                 });
 
+                // The input thread below can block writing to a child that
+                // never reads its stdin, and then cannot see the host hang
+                // up. Watch for that separately and kill the group.
+                let hangup_watch = match (vsock_reader.try_clone(), std::io::pipe()) {
+                    (Ok(conn), Ok((done_rx, done_tx))) => {
+                        let t =
+                            std::thread::spawn(move || kill_on_hangup(conn, child_pid, done_rx));
+                        Some((t, done_tx))
+                    }
+                    _ => None,
+                };
+
                 // Thread: vsock STDIN/KILL frames -> child stdin
                 let child_stdin = child.stdin.take().unwrap();
                 let input_thread = std::thread::spawn(move || {
@@ -1124,12 +1271,27 @@ mod guest {
                 // Wait for output to drain, then wait for child
                 let _ = stdout_thread.join();
                 let _ = stderr_thread.join();
+                // Forget the id and stop the hangup watch once the child has
+                // exited but before it is reaped, so a late kill cannot reach
+                // a reused pid.
+                let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                unsafe {
+                    libc::waitid(
+                        libc::P_PID,
+                        child_pid as libc::id_t,
+                        &mut info,
+                        libc::WEXITED | libc::WNOWAIT,
+                    )
+                };
+                if let Some(id) = req.id {
+                    EXECS.lock().unwrap().remove(&id);
+                }
+                if let Some((t, done_tx)) = hangup_watch {
+                    drop(done_tx);
+                    let _ = t.join();
+                }
                 let status = child.wait().expect("failed to wait on child");
                 let exit_code = status.code().unwrap_or(-1);
-
-                unsafe {
-                    libc::sync();
-                }
 
                 let _ = tx.send((frame::EXIT, frame::exit_payload(exit_code).to_vec()));
                 drop(tx);
@@ -1142,6 +1304,40 @@ mod guest {
                 let msg = format!("failed to spawn: {}", e);
                 let mut w = vsock_writer;
                 let _ = frame::write_frame(&mut w, frame::ERROR, msg.as_bytes());
+            }
+        }
+    }
+
+    /// Kill the group when the host hangs up. Returns without killing once
+    /// the write end of `done` is closed.
+    fn kill_on_hangup(conn: std::net::TcpStream, pgid: i32, done: std::io::PipeReader) {
+        use std::os::unix::io::AsRawFd;
+        let mut fds = [
+            libc::pollfd {
+                fd: done.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: conn.as_raw_fd(),
+                events: libc::POLLRDHUP,
+                revents: 0,
+            },
+        ];
+        loop {
+            let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+            if n < 0 {
+                if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                return;
+            }
+            if fds[0].revents != 0 {
+                return;
+            }
+            if fds[1].revents & (libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR) != 0 {
+                unsafe { libc::kill(-pgid, libc::SIGKILL) };
+                return;
             }
         }
     }
@@ -1231,6 +1427,15 @@ mod guest {
                         if matches!(event.kind, notify::EventKind::Access(_)) {
                             continue;
                         }
+                        // A rename already arrived as its From and To halves.
+                        if matches!(
+                            event.kind,
+                            notify::EventKind::Modify(notify::event::ModifyKind::Name(
+                                notify::event::RenameMode::Both
+                            ))
+                        ) {
+                            continue;
+                        }
                         for path in &event.paths {
                             if gitignore.matched(path, path.is_dir()).is_ignore() {
                                 continue;
@@ -1242,10 +1447,13 @@ mod guest {
                                 Some(p) => p,
                                 None => continue,
                             };
-                            let kind = if event.kind.is_remove() {
-                                shuru_proto::watch_kind::DELETE
-                            } else {
-                                shuru_proto::watch_kind::MODIFY
+                            let kind = match event.kind {
+                                notify::EventKind::Create(_) => shuru_proto::watch_kind::CREATE,
+                                notify::EventKind::Remove(_) => shuru_proto::watch_kind::DELETE,
+                                notify::EventKind::Modify(notify::event::ModifyKind::Name(_)) => {
+                                    shuru_proto::watch_kind::RENAME
+                                }
+                                _ => shuru_proto::watch_kind::MODIFY,
                             };
                             let evt = WatchEvent {
                                 kind,
@@ -1507,13 +1715,6 @@ mod guest {
             libc::waitpid(child_pid, &mut status, 0);
         }
 
-        // Flush all filesystem writes to disk before reporting exit.
-        // Without this, data can be lost if the VM is stopped immediately
-        // after the exit code is sent (e.g. during checkpoint create).
-        unsafe {
-            libc::sync();
-        }
-
         let exit_code = if libc::WIFEXITED(status) {
             libc::WEXITSTATUS(status)
         } else if libc::WIFSIGNALED(status) {
@@ -1525,7 +1726,7 @@ mod guest {
         write_frame_fd(vsock_fd, frame::EXIT, &frame::exit_payload(exit_code));
     }
 
-    fn forward_accept_loop(listener_fd: i32) {
+    fn forward_accept_loop(listener_fd: i32, identity: shuru_proto::hello::Identity) {
         loop {
             let client_fd =
                 unsafe { libc::accept(listener_fd, std::ptr::null_mut(), std::ptr::null_mut()) };
@@ -1535,13 +1736,16 @@ mod guest {
             }
 
             std::thread::spawn(move || {
-                handle_forward_connection(client_fd);
+                handle_forward_connection(client_fd, identity);
             });
         }
     }
 
-    fn handle_forward_connection(fd: i32) {
+    fn handle_forward_connection(fd: i32, identity: shuru_proto::hello::Identity) {
         let mut stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
+        if authenticate(&mut stream, &identity).is_err() {
+            return;
+        }
         let _ = stream.set_nodelay(true);
 
         // Read the forward request frame
@@ -1628,9 +1832,35 @@ mod guest {
             "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
         );
 
+        if let Err(e) = crate::disk::boot() {
+            stage(&format!("root boot failed: {e}"));
+            unsafe {
+                libc::reboot(libc::LINUX_REBOOT_CMD_POWER_OFF);
+            }
+            loop {
+                std::thread::park();
+            }
+        }
         mount_filesystems();
+        if let Err(e) = crate::disk::check_root() {
+            stage(&format!("root boot failed: {e}"));
+            unsafe {
+                libc::reboot(libc::LINUX_REBOOT_CMD_POWER_OFF);
+            }
+            loop {
+                std::thread::park();
+            }
+        }
+        crate::disk::start_watchdog();
         ensure_stdio();
         stage("filesystems mounted");
+
+        let identity = std::fs::read_to_string("/proc/cmdline")
+            .and_then(|cmdline| crate::identity::parse(&cmdline))
+            .unwrap_or_else(|_| {
+                eprintln!("shuru-guest: missing or invalid guest identity");
+                std::process::exit(1);
+            });
 
         // Set hostname
         let hostname = b"shuru\0";
@@ -1640,6 +1870,11 @@ mod guest {
 
         setup_networking();
         stage("networking ready");
+
+        let started = crate::services::start_all();
+        if started > 0 {
+            stage(&format!("{} service(s) starting", started));
+        }
 
         // Register signal handlers (PID 1 has no default signal dispositions)
         unsafe {
@@ -1666,7 +1901,7 @@ mod guest {
             VSOCK_PORT_FORWARD
         ));
         std::thread::spawn(move || {
-            forward_accept_loop(fwd_listener_fd);
+            forward_accept_loop(fwd_listener_fd, identity);
         });
 
         loop {
@@ -1681,7 +1916,7 @@ mod guest {
             eprintln!("shuru-guest: accepted vsock connection");
 
             std::thread::spawn(move || {
-                handle_connection(client_fd);
+                handle_connection(client_fd, identity);
             });
 
             reap_zombies();

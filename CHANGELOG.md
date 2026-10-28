@@ -1,5 +1,374 @@
 # Changelog
 
+## 0.11.0
+
+### Fast boot
+
+`shuru run -- true` on an M-series Mac goes from about 300 ms to about 160
+ms. The guest agent is now `/init` in an uncompressed initramfs and mounts
+the root itself. The old initramfs gunzip, `e2fsck` and offline
+`resize2fs` are gone from the boot path. The kernel replays an old journal
+when it mounts, and a larger disk grows online with `EXT4_IOC_RESIZE_FS`.
+Networking is configured by the agent. The rootfs no longer carries a copy
+of the agent.
+
+The kernel tick goes from 100 Hz to 1000 Hz. virtio_pci_modern sleeps one
+millisecond at a time while a device resets, and on the asynchronous Apple
+reset each of those sleeps cost two jiffies, 10 to 20 ms per device at 100
+Hz. Guest uptime when the command starts drops from 150 ms to 70 ms.
+
+On APFS, growing a clone of a fragmented file costs time in proportion to
+its extent count, 0.5 to 1.5 s for the base image built by
+`prepare-rootfs.sh`. The base is now rewritten sequentially and extended to
+4096 MB once, after download or on the first boot that finds it short, and
+a clone then costs well under a millisecond.
+
+### Sealed checkpoints
+
+Every checkpoint path now freezes ext4 in the guest before the host copies
+the disk, so a saved disk is clean and needs no journal replay. A seal
+carries an id and a lease; the guest thaws itself when the lease runs out,
+and the host publishes the copy only after a matching thaw. A failed save
+keeps the previous checkpoint. A save that died leaves a staging directory
+that the next save of the same name reuses. CAS checkpoints are written as
+standalone indexes, so replacing one cannot form a parent cycle or depend
+on the base image path.
+
+The root is mounted `errors=remount-ro`. A disk with recorded ext4 errors
+refuses to boot and refuses to seal.
+
+### Freed space goes back to the host
+
+A seal runs `FITRIM` for free extents of 1 MiB and up, and `trim` is
+available on a running sandbox from the CLI stdio protocol and both SDKs.
+The Linux block device supports discard and write zeroes, mapped to
+`fallocate` hole punching, with every range bounds checked.
+
+### Disk size
+
+Disks default to 4096 MB, which is now also the minimum. A disk never
+shrinks below its source.
+
+### macOS: a VM that powers off during boot no longer hangs the host
+
+Connecting to the guest waited forever if the VM stopped while the connect
+was pending, because the framework never calls the completion handler. It
+now notices the stopped VM and fails.
+
+### Watch events carry their names again
+
+`file_change` notifications sent `"2"` and `"3"` instead of `"modify"` and
+`"delete"`, and the guest reported every new file as modified. Events are
+`create`, `modify`, `delete` and `rename` again, a rename arrives once for
+each path, and `shuru_proto::watch_kind::name` maps a kind to its name.
+
+### Files of 1 MB and up can be read and written
+
+`read_file` and `write_file` sent the whole file in one frame, and frames
+stop at 1 MB, so larger files failed with a broken pipe. Contents now
+travel in 256 KiB frames. A failed write reports the guest error, and the
+TypeScript SDK no longer rescans a long response line for every chunk it
+receives, which made a 64 MB read take 1.7 s instead of 0.5 s.
+
+### Host memory no longer grows with what the guest does
+
+A guest could grow the host shuru process without limit: by writing to a
+socket the remote never read, by flooding a socket the guest never read, or
+by printing to a spawned process stdout the client never consumed. The old
+build reached 2 GB in five seconds on the last case. The proxy now holds a
+fixed window per connection each way and its smoltcp buffers are halved to
+512 KiB and 256 KiB at the same measured throughput. stdio and SDK event
+queues are bounded, and buffered exec output and file reads fail past 64 MiB
+with an error that points at streaming instead. On Linux the VMM validates virtqueue
+sizes, ring addresses and descriptor chains, and caps virtio-fs handles,
+inodes and request sizes, so a guest cannot loop, crash or inflate it either.
+RFC 0011 has the rule, the remaining per-VM ceilings and the cgroup envelope
+for hosted nodes.
+
+### Kill reaches a process that stopped reading stdin
+
+Stdin and the kill signal shared one connection, so a process that stopped
+reading stdin left the kill queued behind stdin nobody would take, and the
+SDK kept piling stdin up in the shuru process. A kill now sends SIGTERM as
+before and, if the process is still running two seconds later, SIGKILL on a
+connection of its own. The guest also kills a process group when the host
+hangs up on it. In the TypeScript SDK, `write()` on a spawned process now
+returns a promise that resolves once the data reaches the VM; up to 1 MiB
+is in flight and the rest waits in the calling process. The stdio server
+refuses more than 4 MiB of unacknowledged stdin per process. A single write
+over 1 MiB used to break the stream; it is now split.
+
+### Short connections no longer get refused at random
+
+The network proxy added a listener for each guest SYN it inspected, but
+smoltcp also read frames straight from the guest while it polled. A SYN that
+arrived during a poll skipped inspection and was answered with a reset, so a
+loop of short connections failed with "Connection refused" somewhere between
+150 and 475 connections in. smoltcp now only sees inspected frames, and 600
+back to back connections succeed.
+
+### Linux: the guest console works
+
+The Linux backend emulates a PL011 serial port and boots the guest with
+`console=ttyAMA0`, but the kernel was built without the PL011 driver, so a
+Linux guest printed nothing, `--verbose` showed no kernel log and
+`--console` had no console to attach to. The driver is now built in.
+
+The Linux bootloader also dropped `quiet` from every command line. With a
+working console that would print the whole kernel log through the emulated
+UART on every boot, about 230 ms on a1.metal, only to discard it. Linux now
+keeps `quiet` unless `--verbose` is set, as macOS does.
+
+### Checkpoint saves report stopped services again
+
+`shuru checkpoint create --verbose` prints the services that were stopped
+before the save, and every save prints services that ignored SIGTERM.
+
+## 0.10.0
+
+### Linux: a VM can no longer reach another VM
+
+On a Linux host every VM asked vhost-vsock for guest CID 3. vhost CIDs are
+global to the host kernel, so the second VM got EADDRINUSE, the error was
+printed and ignored, and its host side connected to CID 3 anyway: the first
+VM. Reproduced on a1.metal with 0.9.3, a second `shuru run` executed inside
+the first sandbox and printed its marker file and kernel boot_id. macOS was
+not affected.
+
+The Linux backend now emulates virtio-vsock in the VMM instead of using
+vhost-vsock. Each VM has its own device and its own CID space, the host end
+of every connection is a socketpair inside the shuru process, and no other
+process on the host can reach the guest agent. Host data stays in that
+socket until the guest posts receive buffers, then one read puts it
+straight into guest memory across as many buffers as the credit the guest
+grants allows, so nothing queues in the VMM. Guest data goes from guest
+memory to the socket in one write and is only copied when the socket is
+full. Connections opened by the guest are refused. The vhost_vsock module
+is no longer needed.
+
+### Linux: devices no longer share a lock
+
+Every virtio device used to sit behind one lock, and disk and shared folder
+requests ran on the vCPU that rang the doorbell while holding it, so one
+busy device stalled every vCPU touching any other. Each device now has its
+own lock and its own thread. Doorbells go to an eventfd inside KVM, so
+ringing one no longer exits to the VMM, and interrupts fire only when
+buffers were used and the guest asked for them. Raising and acknowledging
+an interrupt now happen under one lock, which closes a window where an
+acknowledgement could lower the line over a newly raised reason.
+
+### The guest checks who is connecting
+
+Every boot gets a random 32 byte token and a 16 byte instance id on the
+kernel command line. The guest agent requires the token as the first frame
+of every connection, on the control channel and on port forwards, and
+answers with the instance id, which the host checks. A connection that
+reaches the wrong VM is refused instead of served, and a guest booted
+without a token stops. The token is redacted from `--verbose` and
+`--console` output. This applies on macOS too.
+
+The protocol version is 2. An OS image older than this release does not
+answer the hello, and `shuru upgrade` fetches the matching one.
+
+Measured on a1.metal against 0.9.3 on the same host, three runs each:
+
+| | 0.9.3 (vhost) | 0.10.0 |
+|---|---|---|
+| exec round trip p50 | 1.6 ms | 1.8 ms |
+| 16 parallel execs | 35 ms | 36 ms |
+| guest to host, 128 MB | 117 to 191 MB/s | 434 to 451 MB/s |
+| host to guest, 128 MB | 353 to 366 MB/s | 315 to 360 MB/s |
+| shared folder read, 128 MB | 241 to 245 MB/s | 343 to 384 MB/s |
+
+### Crates
+
+- `shuru-proto` 0.5.0: `hello::Identity`, the `HELLO` and `HELLO_OK`
+  frames, protocol version 2.
+- `shuru-linux` 0.4.0: breaking. Userspace virtio-vsock,
+  `VirtualMachine::new` returns a `Result`, `GUEST_CID` and `AF_VSOCK` are
+  gone. `kvm::devices`: the bus dispatches to `MmioHandler`, devices take
+  an `Interrupt`, and `VirtioBackend::process_queue` returns whether it
+  used a buffer.
+- `shuru-vm` 0.6.0 and `shuru-sdk` 0.8.0: the hello on every connection.
+  They need a 0.10.0 OS image.
+- `shuru-guest` 0.5.0.
+
+## 0.9.3
+
+### Guest memory goes back to the host
+
+Every VM now carries a virtio memory balloon (RFC 0006). On a Linux host
+the guest kernel reports the pages it has freed and the host discards
+them, so an idle sandbox costs what the guest is using, not what it has
+touched since boot. Measured on a1.metal: a guest that filled and freed
+1 GB took the host process from 1109 MB resident back to 87 MB within
+seven seconds, with nobody asking.
+
+A caller can also set a memory target. The guest gives up the difference
+through the balloon and takes it back when the target rises, on Linux and
+on macOS. `shuru run` is unchanged.
+
+### Crates
+
+- `shuru-linux` 0.3.2: the balloon backend, `set_memory_target` and
+  `ballooned_bytes` on `VirtualMachine`.
+- `shuru-darwin` 0.2.2: `set_memory_target` through the framework balloon.
+- `shuru-vm` 0.5.2: the balloon is attached on both platforms;
+  `Sandbox::set_memory_target`.
+- `shuru-sdk` 0.7.1: `AsyncSandbox::set_memory_target` and the `balloon`
+  example.
+
+## 0.9.2
+
+### The working disk can no longer outlive its run
+
+Every run clones the base image, and until now the clone was a named file
+under `instances/<pid>` that the process deleted on a clean exit. A run
+ended by SIGTERM, a kill, a crash or an SDK program dying left the clone
+behind, and `shuru prune` could not tell: SDK directories were never
+matched, and a reused PID looked alive. Disk usage grew with every
+interrupted run.
+
+The clone is anonymous now. On Linux it is created with `O_TMPFILE` and
+never has a name; on macOS the framework needs a path, so the clone is
+named for the two syscalls between creation and open, then unlinked and
+attached through `/dev/fd`. The kernel frees the blocks when the last
+descriptor closes, however the process ends. Checkpoints are cloned out of
+the open descriptor, instantly on APFS, XFS and btrfs. The `instances`
+directory, the PID naming and `shuru prune` are gone; `shuru upgrade`
+removes a leftover `instances` directory from earlier versions.
+
+Measured on macOS: a run killed with SIGKILL while writing 600 MB returned
+the space to the volume within seconds and left no file behind.
+
+### Crates
+
+- `shuru-darwin` 0.2.1: `clone_path` and `clone_fd` (APFS clones).
+- `shuru-linux` 0.3.1: `open_anonymous` and `reflink`.
+- `shuru-vm` 0.5.1: `WorkDisk`, the anonymous clone, with `attach_path`
+  and `save_to`. Stays free of unsafe code.
+- `shuru-sdk` 0.7.0: breaking. `AsyncSandbox::instance_dir` is removed,
+  there is no directory any more. The Linux SDK path now reflinks instead
+  of copying the base image.
+
+## 0.9.1
+
+### CLI downloads trust the platform certificate store
+
+`shuru upgrade`, `shuru init` and `shuru recipe` verified TLS against a
+bundled root list, so a corporate TLS interceptor such as Netskope failed
+with `UnknownIssuer` (#27). They now use the platform verifier: the system
+keychain on macOS, the system store plus `SSL_CERT_FILE` and `SSL_CERT_DIR`
+on Linux. The connection the proxy opens to a host a secret is bound to
+already honours `SSL_CERT_FILE` and `SSL_CERT_DIR` on both platforms, and
+that is the way to trust an interceptor there; documented in the README.
+
+### Docs
+
+The secrets section now says what responses from a bound host do: they come
+back untouched, so a host that reflects the request shows the real value to
+the guest. Bind a secret only to hosts you trust with it.
+
+## 0.9.0
+
+### Network throughput inside the VM, about 80 times faster
+
+The proxy netstack that backs `--allow-net` capped every guest connection
+at about 1 MB/s whatever the host could do. Contributed by rsclarke in #35:
+the smoltcp poll loop no longer sleeps 1 ms between passes but waits on the
+host socket, the proxy command channel and the stack timer; the TCP buffers
+grow so window scaling can fill the pipe; and the VM network attachment
+runs at a 65535 byte IP-MTU so the stack handles one 64 KiB frame per
+syscall instead of forty at 1500 bytes. `apt-get`, `npm install` and
+release downloads inside the VM now run close to host speed.
+
+On top of that: per-connection buffers are 1 MiB receive and 512 KiB send
+rather than 4 MiB each way, with a ceiling of 512 live sockets, so a guest
+opening hundreds of connections costs the host a bounded amount of memory.
+The host socket buffers are read back after being set and a socket too
+small to carry one frame is an error rather than a silent stall. The Linux
+backend receives frames at the new size.
+
+### Crates
+
+- `shuru-proxy` 0.4.0: larger frames and buffers, `DrainStatus` on the
+  device, `create_socketpair` fails when the kernel caps the buffers.
+- `shuru-darwin` 0.2.0 and `shuru-linux` 0.3.0: breaking.
+  `FileHandleNetworkAttachment::new` takes the IP-MTU.
+- `shuru-vm` 0.5.0 and `shuru-sdk` 0.6.0: pick up the above.
+
+## 0.8.1
+
+### Linux: reflink clones instead of copies
+
+The Linux backend copied the full disk image for every boot and every
+checkpoint, where macOS has always used an APFS clonefile. The clone now
+goes through the FICLONE ioctl, so on XFS with `reflink=1` or btrfs a boot
+and a checkpoint are copy-on-write and cost no disk. Measured on an
+a1.metal host against the same 0.8.0 image: boot 1.3s instead of 9s,
+`checkpoint create` 1.3s instead of 51s, `run --from` 1.0s instead of 35s,
+and a checkpoint allocates 0 bytes instead of 4 GB. Filesystems without
+reflinks still work through the old copy, with a one-time note naming the
+directory so the fix is obvious.
+
+## 0.8.0
+
+### Guest services
+
+An image can declare long running processes in
+`/etc/shuru/services/<name>.json`. The guest init starts them at boot,
+waits for their readiness check before running the command, and stops them
+with SIGTERM before the VM powers off. The host now asks the guest to shut
+down over vsock, which also syncs the disk, so checkpoints are cloned from
+a consistent image on every stop path. `Sandbox::stop()` is graceful and
+`Sandbox::kill()` is the old hard stop. See docs/rfcs/0004-guest-services.md.
+
+### Recipes
+
+`shuru run --recipe REF` and `shuru checkpoint create NAME --recipe REF`
+build a checkpoint from a recipe: a directory with `recipe.json` and shell
+steps, fetched from GitHub at an exact commit or read from a local path.
+`shuru recipe list` shows the official catalog in superhq-ai/recipes and
+`shuru recipe show REF` prints a recipe before it is built. Checkpoints built
+this way record their source and revision, visible in `shuru checkpoint
+list`, and a changed recipe rebuilds on the next run. `--checkpoint NAME`
+on `run` picks the checkpoint name instead of the recipe name. Third-party
+recipes ask for confirmation or `--yes`. The catalog ships `docker` and
+`browser`, headless Chromium as a guest service with the DevTools protocol
+on port 9222, which the Browser Use example now uses. See
+docs/rfcs/0005-recipes.md.
+
+### checkpoint update
+
+`shuru checkpoint update NAME ...` takes the same arguments as `create` and
+replaces an existing checkpoint, or creates it when missing. The new
+checkpoint is built under a staging name and swapped in only when the
+command exits 0, so a failed update leaves the old one in place.
+`--from NAME` layers the command onto the existing checkpoint and
+`--recipe REF` rebuilds from a recipe. Closes #44.
+
+### Docker Engine runs inside the VM
+
+The `docker` recipe installs pinned docker-ce 29.9.2 and containerd 2.4.2,
+declares dockerd as a guest service, and pre-pulls one image, so
+`shuru checkpoint create docker --recipe docker` followed by
+`shuru run --from docker -- docker run ...` just works, as does
+`shuru run --recipe docker` on its own. Containers get the same boundary as
+any guest process: no egress without `--allow-net`, the host allowlist
+applied by the proxy, host ports only through `-p`.
+
+To support it, the guest kernel gains cgroup v2 controllers, cgroup BPF,
+seccomp filters, veth, and the netfilter targets dockerd installs, and moves
+to Linux 6.12.114. The guest init now mounts cgroup2 on /sys/fs/cgroup and
+tmpfs on /run and /dev/shm. `/run` is therefore no longer persisted into
+checkpoints.
+
+`SHURU_DATA_DIR` overrides the data directory so builds and tests can use
+their own kernel, initramfs and checkpoints. `scripts/build-kernel-hf.sh`
+builds the kernel on a Hugging Face CPU job.
+
+See docs/rfcs/0003-docker-on-shuru.md.
+
 ## 0.7.0
 
 ### Secrets can be refreshed while the VM runs
